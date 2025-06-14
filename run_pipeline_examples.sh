@@ -1,145 +1,206 @@
 #!/bin/bash
+set -e  # Exit on any error
 
+# Change to project directory
 cd /root/workspace/eagle
 
+# Activate virtual environment
 source ./v_eagle/bin/activate
 
-pip install vllm --extra-index-url https://download.pytorch.org/whl/cu125 
+# Install vLLM if needed
+pip install vllm --extra-index-url https://download.pytorch.org/whl/cu125
+pip install scikit-learn
 
-# 设置一个醒目的颜色，用于输出信息
+# Color codes for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-echo -e "${GREEN}正在检查占用GPU的进程...${NC}"
+# ===== CONFIGURATION =====
+BASE_MODEL_PATH="/root/workspace/TensorRT-LLM/workspace/model/Qwen3-32B"
+TEACHER_MODEL_PATH="/root/workspace/TensorRT-LLM/workspace/model/Qwen3-32B"
+OUTPUT_DIR="./eagle_qwen_data_v3"
+VLLM_PORT=8500
+EVAL_SPLIT_RATIO=0.05  # 5% for evaluation
 
-PIDS=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits | awk '/[0-9]/{print $1}')
+# ===== UTILITY FUNCTIONS =====
 
-# 检查是否有找到进程
-if [ -z "$PIDS" ]; then
-    echo -e "${GREEN}没有发现占用GPU的进程。显存是干净的！${NC}"
-else
-    echo -e "${RED}发现以下占用GPU的进程PID: ${PIDS}${NC}"
-    echo "准备清理这些进程..."
-
-    # 循环遍历所有找到的PID并杀死它们
-    for PID in $PIDS; do
-        # 检查PID是否真的是一个数字，防止意外
-        if [[ "$PID" =~ ^[0-9]+$ ]]; then
-            echo -e "正在杀死进程 ${RED}$PID${NC}..."
-            # 使用 kill -9 强制杀死进程
-            kill -9 $PID
-            if [ $? -eq 0 ]; then
-                echo -e "进程 ${GREEN}$PID 已成功清理。${NC}"
-            else
-                echo -e "${RED}清理进程 $PID 失败。可能需要手动干预。${NC}"
+cleanup_gpu() {
+    echo -e "${GREEN}Checking for GPU-using processes...${NC}"
+    
+    PIDS=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | awk '/[0-9]/{print $1}' || true)
+    
+    if [ -z "$PIDS" ]; then
+        echo -e "${GREEN}No GPU-using processes found. GPU memory is clean!${NC}"
+    else
+        echo -e "${RED}Found GPU-using processes: $PIDS${NC}"
+        echo "Cleaning up these processes..."
+        
+        for PID in $PIDS; do
+            if [[ "$PID" =~ ^[0-9]+$ ]]; then
+                echo -e "Killing process ${RED}$PID${NC}..."
+                kill -9 $PID 2>/dev/null && echo -e "Process ${GREEN}$PID cleaned.${NC}" || echo -e "${RED}Failed to kill $PID${NC}"
             fi
-        fi
-    done
+        done
+    fi
+}
 
-    echo -e "${GREEN}所有GPU进程清理完毕！${NC}"
-fi
-
-sleep 5  # 等待进程完全结束
-
-echo -e "${GREEN}正在检查占用GPU的进程...${NC}"
-# (您原来的清理GPU进程的逻辑保持不变)
-# ...
-
-# --- 新增的清理端口逻辑 ---
-echo -e "${GREEN}正在检查并清理端口 ${TARGET_PORT}...${NC}"
-
-# 使用 lsof 命令查找占用指定端口的进程PID
-# lsof -t -i:PORT 会直接返回PID，更精确
-PIDS_ON_PORT=$(lsof -t -i:${TARGET_PORT})
-
-if [ -z "$PIDS_ON_PORT" ]; then
-    echo -e "${GREEN}端口 ${TARGET_PORT} 是干净的，没有进程占用。${NC}"
-else
-    echo -e "${RED}发现以下进程PID占用了端口 ${TARGET_PORT}: ${PIDS_ON_PORT}${NC}"
-    echo "准备清理这些进程..."
-
-    for PID in $PIDS_ON_PORT; do
-        if [[ "$PID" =~ ^[0-9]+$ ]]; then
-            echo -e "正在强制杀死进程 ${RED}$PID${NC}..."
-            # 使用 kill -9 强制杀死进程
-            kill -9 $PID
-            if [ $? -eq 0 ]; then
-                echo -e "进程 ${GREEN}$PID 已成功清理。${NC}"
-            else
-                echo -e "${RED}清理进程 $PID 失败。可能需要手动干预。${NC}"
+cleanup_port() {
+    local PORT=$1
+    echo -e "${GREEN}Checking port $PORT...${NC}"
+    
+    PIDS_ON_PORT=$(lsof -t -i:$PORT 2>/dev/null || true)
+    
+    if [ -z "$PIDS_ON_PORT" ]; then
+        echo -e "${GREEN}Port $PORT is clean.${NC}"
+    else
+        echo -e "${RED}Found processes using port $PORT: $PIDS_ON_PORT${NC}"
+        for PID in $PIDS_ON_PORT; do
+            if [[ "$PID" =~ ^[0-9]+$ ]]; then
+                kill -9 $PID 2>/dev/null && echo -e "Process ${GREEN}$PID cleaned.${NC}"
             fi
-        fi
-    done
-    echo -e "${GREEN}所有占用端口 ${TARGET_PORT} 的进程清理完毕！${NC}"
-fi
-# --- 新增逻辑结束 ---
+        done
+    fi
+}
 
+# ===== CLEANUP =====
+echo -e "${YELLOW}=== Cleaning up resources ===${NC}"
+cleanup_gpu
+cleanup_port $VLLM_PORT
+sleep 5
 
-sleep 5  # 等待进程完全结束
-
-# 后台运行 OpenAI API 服务器
-echo "启动 vLLM API 服务器（仅用于带 teacher 的数据处理）..."
-nohup python3 -m vllm.entrypoints.openai.api_server \
-       --model /root/workspace/TensorRT-LLM/workspace/model/Qwen3-32B \
-       --port 8500 \
-       --gpu-memory-utilization 0.8 \
-       --dtype bfloat16 \
-       --tensor-parallel-size 8 > vllm_server.log 2>&1 &
-
-# 保存进程ID
-VLLM_PID=$!
-echo "vLLM 服务器已在后台启动，PID: $VLLM_PID"
-
-# 等待服务器启动
-wait_time=150
-echo "等待服务器启动 (预计 $wait_time 秒)..."
-
-# 使用 for 循环进行倒计时
-for ((i=$wait_time; i>=0; i--)); do
-    # 使用 \r 回到行首，-n 不换行，实现原地更新
-    echo -ne "剩余时间: $i 秒... \r"
-    sleep 1
-done
-
-echo -e "\n服务器启动检查完成"
-
-# 检查服务器是否启动成功
-if curl -s http://localhost:8500/v1/models > /dev/null; then
-    echo "服务器启动成功！"
-else
-    echo "服务器启动失败，请检查日志文件 vllm_server.log"
-    exit 1
-fi
-
-# 1. Qwen model with teacher (full pipeline)
-echo "开始运行 Eagle 数据处理（带 teacher）..."
+# ===== STAGE 1: BUILD DATASET WITH SPLIT =====
+echo -e "${YELLOW}=== STAGE 1: Building and splitting dataset ===${NC}"
 python eagle_data_pipeline.py \
-    --spec "openai/gsm8k:20000,tatsu-lab/alpaca:20000,anthropic/hh-rlhf:40000,openai/webgpt_comparisons:20000" \
-    --base-model "/root/workspace/TensorRT-LLM/workspace/model/Qwen3-32B" \
-    --teacher-model "/root/workspace/TensorRT-LLM/workspace/model/Qwen3-32B" \
-    --teacher-url "http://localhost:8500/v1/completions" \
-    --output-dir "./eagle_qwen_data" \
-    --cn-weight 0 \
-    --teacher-k 20 \
-    --concurrency 16 \
+    --stage build \
+    --spec "openai/gsm8k:main:20000,tatsu-lab/alpaca:20000,anthropic/hh-rlhf:40000,openai/webgpt_comparisons:20000" \
+    --output-dir "$OUTPUT_DIR" \
+    --eval-split-ratio $EVAL_SPLIT_RATIO \
+    --cn-weight 1.0 \
+    --seed 42
+
+# ===== STAGE 2: EXTRACT BASE MODEL FEATURES (WITH LOGITS) =====
+echo -e "${YELLOW}=== STAGE 2: Extracting base model features and logits ===${NC}"
+
+# Process training data
+echo "Processing training data..."
+python eagle_data_pipeline.py \
+    --stage extract_base \
+    --base-model "$BASE_MODEL_PATH" \
+    --prompts-dir "${OUTPUT_DIR}/prompts/train" \
+    --output-dir "${OUTPUT_DIR}/base_features/train" \
     --max-length 2048 \
+    --device "cuda" \
+    --num-gpus 8 \
+    --save-topk 20 \
+    --teacher-temperature 1.0 \
     --resume
 
-# 关闭 vLLM 服务器，释放显存
-echo "关闭 vLLM 服务器，释放显存..."
-kill $VLLM_PID
-sleep 5  # 等待进程完全结束
-echo "vLLM 服务器已关闭"
+# Process evaluation data
+echo "Processing evaluation data..."
+python eagle_data_pipeline.py \
+    --stage extract_base \
+    --base-model "$BASE_MODEL_PATH" \
+    --prompts-dir "${OUTPUT_DIR}/prompts/eval" \
+    --output-dir "${OUTPUT_DIR}/base_features/eval" \
+    --max-length 2048 \
+    --device "cuda" \
+    --num-gpus 8 \
+    --save-topk 20 \
+    --teacher-temperature 1.0 \
+    --resume
 
-# # 训练 Eagle 模型
-echo "开始训练 Eagle 模型..."
+# ===== STAGE 3: EXTRACT TEACHER FEATURES (OPTIONAL) =====
+if [ -n "$TEACHER_MODEL_PATH" ]; then
+    echo -e "${YELLOW}=== STAGE 3: Extracting teacher features ===${NC}"
+    
+    # Start vLLM server
+    echo "Starting vLLM API server..."
+    nohup python3 -m vllm.entrypoints.openai.api_server \
+        --model "$TEACHER_MODEL_PATH" \
+        --port $VLLM_PORT \
+        --gpu-memory-utilization 0.8 \
+        --dtype bfloat16 \
+        --tensor-parallel-size 8 > vllm_server.log 2>&1 &
+    
+    VLLM_PID=$!
+    echo "vLLM server started with PID: $VLLM_PID"
+    
+    # Wait for server to be ready
+    echo "Waiting for vLLM server to start..."
+    for i in {1..150}; do
+        if curl -s http://localhost:$VLLM_PORT/v1/models > /dev/null 2>&1; then
+            echo -e "${GREEN}vLLM server is ready!${NC}"
+            break
+        fi
+        echo -ne "Waiting... $i/150\r"
+        sleep 1
+    done
+    
+    # Extract teacher features for training data
+    echo "Extracting teacher features for training data..."
+    python eagle_data_pipeline.py \
+        --stage extract_teacher \
+        --teacher-model "$TEACHER_MODEL_PATH" \
+        --teacher-url "http://localhost:$VLLM_PORT/v1/completions" \
+        --prompts-dir "${OUTPUT_DIR}/prompts/train" \
+        --output-dir "${OUTPUT_DIR}/teacher_features/train" \
+        --teacher-k 20 \
+        --concurrency 16 \
+        --resume
+    
+    # Extract teacher features for evaluation data
+    echo "Extracting teacher features for evaluation data..."
+    python eagle_data_pipeline.py \
+        --stage extract_teacher \
+        --teacher-model "$TEACHER_MODEL_PATH" \
+        --teacher-url "http://localhost:$VLLM_PORT/v1/completions" \
+        --prompts-dir "${OUTPUT_DIR}/prompts/eval" \
+        --output-dir "${OUTPUT_DIR}/teacher_features/eval" \
+        --teacher-k 20 \
+        --concurrency 16 \
+        --resume
+    
+    # Kill vLLM server
+    echo "Shutting down vLLM server..."
+    kill $VLLM_PID
+    sleep 5
+    
+    # ===== STAGE 4: MERGE FEATURES =====
+    echo -e "${YELLOW}=== STAGE 4: Merging features ===${NC}"
+    
+    # Merge training features
+    python eagle_data_pipeline.py \
+        --stage merge \
+        --base-dir "${OUTPUT_DIR}/base_features/train" \
+        --teacher-dir "${OUTPUT_DIR}/teacher_features/train" \
+        --output-dir "${OUTPUT_DIR}/final_features/train"
+    
+    # Merge evaluation features
+    python eagle_data_pipeline.py \
+        --stage merge \
+        --base-dir "${OUTPUT_DIR}/base_features/eval" \
+        --teacher-dir "${OUTPUT_DIR}/teacher_features/eval" \
+        --output-dir "${OUTPUT_DIR}/final_features/eval"
+else
+    echo -e "${YELLOW}=== No teacher model specified, using base features only ===${NC}"
+    cp -r "${OUTPUT_DIR}/base_features/train" "${OUTPUT_DIR}/final_features/train"
+    cp -r "${OUTPUT_DIR}/base_features/eval" "${OUTPUT_DIR}/final_features/eval"
+fi
+
+# ===== STAGE 5: TRAIN EAGLE MODEL =====
+echo -e "${YELLOW}=== STAGE 5: Training EAGLE model ===${NC}"
+
+# Note: We no longer need --base_model parameter!
+# You'll need to add --vocab_size and --hidden_size based on your model
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
-accelerate launch \
-  train_eagle_v3.py \
-    --base_model "/root/workspace/TensorRT-LLM/workspace/model/Qwen3-32B" \
-    --data_path "./eagle_qwen_data/final_features" \
-    --output_dir "./eagle_qwen_draft" \
+accelerate launch train_eagle_v3.py \
+    --data_path "${OUTPUT_DIR}/final_features/train" \
+    --eval_data_path "${OUTPUT_DIR}/final_features/eval" \
+    --output_dir "./eagle_qwen_draft_v3" \
+    --vocab_size 152064 \
+    --hidden_size 4096 \
     --batch_size 8 \
     --lr 5e-5 \
     --epochs 10 \
@@ -152,35 +213,27 @@ accelerate launch \
     --enable_trace \
     --gradient_accumulation_steps 4
 
-echo "训练完成！开始准备评估数据集..."
-
-# 准备评估数据集
-echo "准备评估数据集..."
+# ===== STAGE 6: PREPARE EVALUATION DATASETS =====
+echo -e "${YELLOW}=== STAGE 6: Preparing evaluation datasets ===${NC}"
 python prepare_eval_datasets.py
 
-echo "评估数据集准备完成！开始运行 EAGLE-3 评估..."
+# ===== STAGE 7: RUN EVALUATION =====
+echo -e "${YELLOW}=== STAGE 7: Running evaluation ===${NC}"
 
-# 运行一个小样本评估进行快速验证
-echo "运行快速验证评估（2个样本）..."
+# Quick test with 2 samples
+echo "Running quick evaluation..."
 python eagle_v3_eval.py \
-    --base_model /root/workspace/TensorRT-LLM/workspace/model/Qwen3-32B \
-    --draft_ckpt ./eagle_qwen_draft/final/ \
+    --base_model "$BASE_MODEL_PATH" \
+    --draft_ckpt "./eagle_qwen_draft_v3/final/" \
     --dataset gsm8k \
-    --data_path ./eval_datasets/gsm8k_test.jsonl \
+    --data_path "./eval_datasets/gsm8k_test.jsonl" \
     --num_samples 2 \
     --max_new_tokens 128 \
     --temperature 1.0 \
     --output_file results_gsm8k_quick.json
 
-echo "所有任务已完成！评估结果已保存到 results_gsm8k_full.json 和 results_gsm8k_quick.json"
-
-# echo "运行快速验证评估（2个样本）..."
-# python eagle_v3_eval.py \
-#     --base_model /root/workspace/TensorRT-LLM/workspace/model/Qwen3-32B \
-#     --draft_ckpt ./eagle_qwen_draft/final/ \
-#     --dataset mt-bench \
-#     --data_path ./eval_datasets/mt_bench.json \
-#     --num_samples 2 \
-#     --max_new_tokens 128 \
-#     --temperature 1.0 \
-#     --output_file results_mt_bench_quick.json
+echo -e "${GREEN}=== All tasks completed successfully! ===${NC}"
+echo "Training data: ${OUTPUT_DIR}/final_features/train"
+echo "Evaluation data: ${OUTPUT_DIR}/final_features/eval"
+echo "Model checkpoint: ./eagle_qwen_draft_v3/final/"
+echo "Evaluation results: results_gsm8k_quick.json"

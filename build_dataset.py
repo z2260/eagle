@@ -27,52 +27,79 @@ log = logging.getLogger(__name__)
 def sample_and_format_dataset(
     dataset_name: str,
     num_samples: int,
+    config_name: Optional[str] = None,
     seed: int = 2025,
     cn_weight: float = 1.0,
     stream: bool = False
 ) -> List[Dict[str, Any]]:
     """Sample and format a single dataset, returning data instead of writing."""
-    log.info(f"Processing {dataset_name} with {num_samples} samples")
     
-    # Load dataset
-    if "/" in dataset_name:
-        ds = datasets.load_dataset(dataset_name, split="train", streaming=stream)
+    # 修改日志，如果存在config，就打印出来
+    if config_name:
+        log.info(f"Processing {dataset_name} (config: {config_name}) with {num_samples} samples")
     else:
-        ds = datasets.load_dataset(dataset_name, split="train", streaming=stream)
-    
+        log.info(f"Processing {dataset_name} with {num_samples} samples")
+
+    # 修改 load_dataset 调用，以支持 config_name
+    try:
+        ds = datasets.load_dataset(
+            dataset_name,
+            name=config_name,
+            split="train",
+            streaming=stream
+        )
+    except Exception as e:
+        log.error(f"Failed to load dataset {dataset_name} with config '{config_name}': {e}")
+        return []
+
     # Sample data
     sampled_data = []
     rng = random.Random(seed)
-    
+
     if stream:
         # For streaming, we need to iterate
-        for i, sample in enumerate(ds):
-            if i >= num_samples:
-                break
+        # Use a simple counter for streaming sampling
+        taken_samples = list(ds.take(num_samples))
+        for sample in taken_samples:
             formatted = format_sample(sample, dataset_name)
             if formatted:
                 sampled_data.append(formatted)
+        # Ensure we don't log a warning if the stream has fewer samples than requested
+        if len(taken_samples) < num_samples:
+             log.warning(f"Stream for {dataset_name} had only {len(taken_samples)} samples, less than the {num_samples} requested.")
+
     else:
         # For non-streaming, we can sample randomly
-        indices = list(range(len(ds)))
+        num_available = len(ds)
+        if num_available == 0:
+            log.warning(f"Dataset {dataset_name} is empty.")
+            return []
+        
+        indices = list(range(num_available))
         rng.shuffle(indices)
         
-        for i in range(min(num_samples, len(ds))):
+        for i in range(min(num_samples, num_available)):
             sample = ds[indices[i]]
             formatted = format_sample(sample, dataset_name)
             if formatted:
                 sampled_data.append(formatted)
-    
+        
+        if num_available < num_samples:
+            log.warning(f"Dataset {dataset_name} has only {num_available} samples, less than the {num_samples} requested.")
+
+
     # Apply Chinese weighting if needed
     if cn_weight > 1.0:
         chinese_samples = [s for s in sampled_data if contains_chinese(s.get("turns", [""])[0])]
-        extra_cn = int(len(chinese_samples) * (cn_weight - 1))
-        if extra_cn > 0:
-            extra_samples = rng.choices(chinese_samples, k=extra_cn)
-            sampled_data.extend(extra_samples)
-            log.info(f"Added {extra_cn} extra Chinese samples due to cn_weight={cn_weight}")
-    
+        if chinese_samples: # Avoid error if no Chinese samples are found
+            extra_cn = int(len(chinese_samples) * (cn_weight - 1))
+            if extra_cn > 0:
+                extra_samples = rng.choices(chinese_samples, k=extra_cn)
+                sampled_data.extend(extra_samples)
+                log.info(f"Added {extra_cn} extra Chinese samples due to cn_weight={cn_weight}")
+
     return sampled_data
+
 
 
 def format_sample(sample: Dict, dataset_name: str) -> Optional[Dict[str, Any]]:
@@ -185,7 +212,7 @@ def build_dataset(
 ) -> Optional[Tuple[List[Dict], List[Dict]]]:
     """
     Build dataset from specification.
-    
+
     Args:
         spec: Dataset specification string
         output_root: Output directory
@@ -194,74 +221,103 @@ def build_dataset(
         stream: Use streaming mode
         eval_split_ratio: Ratio of data to use for evaluation (0.0 means no split)
         return_data: If True, return data instead of writing to disk
-        
+
     Returns:
         If return_data is True, returns (train_data, eval_data) tuple
     """
-    # Parse specification
+    # Parse specification with support for 'repo:config:samples' and 'repo:samples'
     dataset_specs = []
     for part in spec.split(","):
-        if ":" in part:
-            name, count = part.rsplit(":", 1)
-            dataset_specs.append((name.strip(), int(count.strip())))
+        part = part.strip()
+        if not part:
+            continue
+        
+        parts = part.split(':')
+        
+        name, config, count_str = "", None, ""
+        
+        if len(parts) == 3:
+            # Format: repo_id:config_name:num_samples
+            name, config, count_str = parts[0], parts[1], parts[2]
+        elif len(parts) == 2:
+            # Format: repo_id:num_samples
+            name, count_str = parts[0], parts[1]
         else:
-            raise ValueError(f"Invalid specification: {part}")
-    
+            log.error(f"Invalid specification part: '{part}'. Expected 'repo:samples' or 'repo:config:samples'.")
+            continue
+            
+        try:
+            count = int(count_str)
+            dataset_specs.append({'name': name, 'config': config, 'count': count})
+        except ValueError:
+            log.error(f"Invalid sample count in spec part: '{part}'")
+            continue
+
     log.info(f"Building dataset from {len(dataset_specs)} sources")
-    
+
     # Collect all data
     all_data = []
-    for dataset_name, num_samples in dataset_specs:
+    for spec_item in dataset_specs:
         samples = sample_and_format_dataset(
-            dataset_name, num_samples, seed, cn_weight, stream
+            dataset_name=spec_item['name'],
+            num_samples=spec_item['count'],
+            config_name=spec_item['config'],
+            seed=seed,
+            cn_weight=cn_weight,
+            stream=stream
         )
         all_data.extend(samples)
-    
+
     # Shuffle all data
     rng = random.Random(seed)
     rng.shuffle(all_data)
-    
+
     # Split data if requested
-    if eval_split_ratio > 0:
-        train_data, eval_data = train_test_split(
-            all_data, 
-            test_size=eval_split_ratio, 
-            random_state=seed
-        )
-        log.info(f"Split data: {len(train_data)} train, {len(eval_data)} eval")
+    if eval_split_ratio > 0 and eval_split_ratio < 1.0:
+        if len(all_data) > 1:
+            train_data, eval_data = train_test_split(
+                all_data,
+                test_size=eval_split_ratio,
+                random_state=seed
+            )
+            log.info(f"Split data: {len(train_data)} train, {len(eval_data)} eval")
+        else:
+            log.warning("Not enough data to create a train/eval split. All data will be used for training.")
+            train_data = all_data
+            eval_data = []
     else:
         train_data = all_data
         eval_data = []
-    
+
     if return_data:
         return train_data, eval_data
-    
+
     # Write to disk
     output_path = Path(output_root)
     output_path.mkdir(parents=True, exist_ok=True)
-    
+
     # Write train data
     if train_data:
         train_dir = output_path / "train"
         train_dir.mkdir(exist_ok=True)
         train_file = train_dir / "data.jsonl"
-        
+
         with open(train_file, 'w', encoding='utf-8') as f:
             for sample in train_data:
                 f.write(json.dumps(sample, ensure_ascii=False) + '\n')
         log.info(f"Wrote {len(train_data)} training samples to {train_file}")
-    
+
     # Write eval data
     if eval_data:
         eval_dir = output_path / "eval"
         eval_dir.mkdir(exist_ok=True)
         eval_file = eval_dir / "data.jsonl"
-        
+
         with open(eval_file, 'w', encoding='utf-8') as f:
             for sample in eval_data:
                 f.write(json.dumps(sample, ensure_ascii=False) + '\n')
         log.info(f"Wrote {len(eval_data)} evaluation samples to {eval_file}")
-    
+
     log.info(f"Dataset building complete. Total samples: {len(all_data)}")
 
 

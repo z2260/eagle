@@ -1,15 +1,18 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-preprocess_data.py - Modified to save target logits for offline KL distillation
+preprocess_data.py - Optimized version that saves top-k probabilities instead of full logits
 """
 
 # =========================================
 # 预处理阶段要拼接的隐藏层个数（训练侧是 3）
 FUSE_LAYERS = 3
+# 保存的top-k概率数量
+TOPK_PROBS = 20
 # =========================================
 
 import torch
+import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from pathlib import Path
 from typing import List, Dict, Union, Tuple
@@ -28,22 +31,19 @@ log = logging.getLogger(__name__)
 def get_fusion_indices(model_name: str, num_hidden_layers: int) -> List[int]:
     """
     Determines the correct layer indices for feature fusion based on the model type.
-    This mirrors the adapter logic in train_eagle_v3.py.
     """
     model_name_lower = model_name.lower()
     
     if "qwen" in model_name_lower:
-        # Qwen3-specific layer selection
         log.info(f"Using Qwen-specific fusion strategy for {model_name}")
         raw = [2, num_hidden_layers // 3, 2 * num_hidden_layers // 3]
     else:
-        # Default strategy for Llama-like models
         log.info(f"Using default Llama-like fusion strategy for {model_name}")
         raw = [num_hidden_layers // 4,
                num_hidden_layers // 2,
                num_hidden_layers - 2]
     
-    indices = list(dict.fromkeys(raw))  # 去重并保序
+    indices = list(dict.fromkeys(raw))
     if max(indices) >= num_hidden_layers:
         raise ValueError("fusion index overflow")
     
@@ -58,31 +58,17 @@ def get_fusion_indices(model_name: str, num_hidden_layers: int) -> List[int]:
 def fuse_hidden_states(hidden_states_tuple: Tuple[torch.Tensor], indices: List[int]) -> torch.Tensor:
     """
     Fuse hidden states from multiple layers.
-    
-    Args:
-        hidden_states_tuple: Tuple of hidden states from all layers (including embedding)
-        indices: List of layer indices to fuse
-        
-    Returns:
-        Fused features of shape [seq_len, 3 * hidden_size]
     """
-    # hidden_states_tuple[0] is the embedding layer output
-    # hidden_states_tuple[1] to hidden_states_tuple[n] are the transformer layer outputs
-    
     selected_states = []
     for idx in indices:
-        # Add 1 because hidden_states[0] is embedding layer
         layer_hidden = hidden_states_tuple[idx + 1]
-        # Remove batch dimension if present
         if layer_hidden.dim() == 3:
-            layer_hidden = layer_hidden[0]  # [seq_len, hidden_size]
+            layer_hidden = layer_hidden[0]
         selected_states.append(layer_hidden)
     
-    # Concatenate along feature dimension
-    fused = torch.cat(selected_states, dim=-1)  # [seq_len, 3 * hidden_size]
+    fused = torch.cat(selected_states, dim=-1)
     exp_dim = selected_states[0].size(-1) * FUSE_LAYERS
-    assert fused.size(-1) == exp_dim, \
-        f"fused dim {fused.size(-1)} ≠ {exp_dim}"
+    assert fused.size(-1) == exp_dim, f"fused dim {fused.size(-1)} ≠ {exp_dim}"
     
     return fused
 
@@ -90,7 +76,6 @@ def fuse_hidden_states(hidden_states_tuple: Tuple[torch.Tensor], indices: List[i
 def iter_jsonl_prompts(prompts_dir: Union[str, Path]) -> List[Dict[str, str]]:
     """
     Iterate through all .jsonl files in the directory and extract prompts.
-    Returns list of dicts with 'id' and 'prompt' keys.
     """
     prompts_dir = Path(prompts_dir)
     all_prompts = []
@@ -101,14 +86,12 @@ def iter_jsonl_prompts(prompts_dir: Union[str, Path]) -> List[Dict[str, str]]:
             for line_num, line in enumerate(f):
                 try:
                     record = json.loads(line.strip())
-                    # Extract prompt from 'turns' field (EAGLE format)
                     if 'turns' in record and record['turns']:
                         prompt_text = record['turns'][0]
                     else:
                         log.warning(f"No 'turns' field in record: {record.get('id', f'line_{line_num}')}")
                         continue
                     
-                    # Also get the reference answer if available
                     reference = record.get('reference', [])
                     
                     all_prompts.append({
@@ -123,6 +106,31 @@ def iter_jsonl_prompts(prompts_dir: Union[str, Path]) -> List[Dict[str, str]]:
     return all_prompts
 
 
+def extract_topk_probs(logits: torch.Tensor, k: int = 20, temperature: float = 1.0) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Extract top-k probabilities from logits.
+    
+    Args:
+        logits: Raw logits tensor [seq_len, vocab_size]
+        k: Number of top probabilities to keep
+        temperature: Temperature for softmax
+        
+    Returns:
+        topk_indices: [seq_len, k] tensor of token indices
+        topk_probs: [seq_len, k] tensor of probabilities
+    """
+    # Apply temperature
+    scaled_logits = logits / temperature
+    
+    # Convert to probabilities
+    probs = F.softmax(scaled_logits, dim=-1)
+    
+    # Get top-k
+    topk_probs, topk_indices = torch.topk(probs, k=min(k, probs.size(-1)), dim=-1)
+    
+    return topk_indices, topk_probs
+
+
 def preprocess_dataset(
     model_name: str,
     prompts_dir: str,
@@ -130,18 +138,20 @@ def preprocess_dataset(
     max_length: int = 2048,
     device: str = "auto",
     resume: bool = True,
-    save_logits: bool = True,  # New parameter
+    save_topk: int = 20,
+    temperature: float = 1.0,
 ):
-    """Extract and fuse hidden states from base model, optionally save logits."""
+    """Extract and fuse hidden states from base model, save top-k probabilities."""
     
     log.info(f"Loading base model: {model_name}")
+    log.info(f"Will save top-{save_topk} probabilities (temperature={temperature})")
     
     # Load model with appropriate dtype
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.bfloat16,
         device_map=device,
-        trust_remote_code=True  # For models like Qwen
+        trust_remote_code=True
     )
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     
@@ -150,7 +160,7 @@ def preprocess_dataset(
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
     
-    model.eval()  # Set model to evaluation mode
+    model.eval()
     
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -160,7 +170,6 @@ def preprocess_dataset(
     fusion_indices = get_fusion_indices(model_name, num_hidden_layers)
     
     log.info(f"Model has {num_hidden_layers} layers. Using layers {fusion_indices} for fusion.")
-    log.info(f"Save logits: {save_logits}")
     
     # Load all prompts
     prompts = iter_jsonl_prompts(prompts_dir)
@@ -186,7 +195,6 @@ def preprocess_dataset(
         try:
             # Combine prompt and reference for full context
             if reference_text:
-                # Format as a conversation turn
                 full_text = f"{prompt_text}\n\nAssistant: {reference_text}"
             else:
                 full_text = prompt_text
@@ -217,35 +225,44 @@ def preprocess_dataset(
                     outputs.hidden_states,
                     fusion_indices
                 )
+                
+                # Extract top-k probabilities
+                topk_indices, topk_probs = extract_topk_probs(
+                    outputs.logits[0], 
+                    k=save_topk,
+                    temperature=temperature
+                )
             
-            # Create loss mask (1 for all positions by default)
+            # Create loss mask
             loss_mask = torch.ones_like(inputs['input_ids'][0])
             
-            # If we have a reference, we might want to only compute loss on the response part
+            # If we have a reference, mask out the prompt part
             if reference_text and prompt_text:
-                # Find where the response starts (approximate)
                 prompt_tokens = tokenizer(prompt_text, add_special_tokens=False).input_ids
                 prompt_len = len(prompt_tokens)
-                # Mask out the prompt part
                 loss_mask[:prompt_len] = 0
+                
+                # Also don't save teacher probs for masked positions to save space
+                # Set top-k probs to zero for masked positions
+                topk_probs = topk_probs * loss_mask.unsqueeze(-1)
             
             # Prepare data to save
             save_data = {
                 'id': prompt_id,
                 'input_ids': inputs['input_ids'][0].cpu(),
-                'hidden_states': fused_features.cpu(),  # [seq_len, 3 * hidden_size]
+                'hidden_states': fused_features.cpu(),
                 'attention_mask': inputs['attention_mask'][0].cpu(),
                 'loss_mask': loss_mask.cpu(),
-                'num_fused_layers': FUSE_LAYERS,  # Number of layers fused
+                'num_fused_layers': FUSE_LAYERS,
+                # Save top-k probabilities instead of full logits
+                'teacher_topk_indices': topk_indices.to(torch.int32).cpu(),  # int32 for token ids
+                'teacher_topk_probs': topk_probs.to(torch.float16).cpu(),    # float16 for probs
+                'teacher_temperature': temperature,
+                'teacher_topk': save_topk,
             }
             
-            # Save logits if requested (for offline KL distillation)
-            if save_logits:
-                # Convert logits to bfloat16 to save space
-                save_data['target_logits'] = outputs.logits[0].to(dtype=torch.bfloat16).cpu()
-            
-            # Save the processed sample
-            torch.save(save_data, save_path)
+            # Save with compression
+            torch.save(save_data, save_path, _use_new_zipfile_serialization=True)
             
             processed_count += 1
             
@@ -255,6 +272,13 @@ def preprocess_dataset(
     
     log.info(f"Preprocessing complete. Processed: {processed_count}, Skipped: {skipped_count}")
     log.info(f"Output saved to {output_dir}")
+    
+    # Estimate disk usage
+    if processed_count > 0:
+        sample_file = list(output_dir.glob("*.pt"))[0]
+        sample_size = sample_file.stat().st_size / (1024 * 1024)  # MB
+        total_estimated = sample_size * len(prompts) / 1024  # GB
+        log.info(f"Estimated total disk usage: {total_estimated:.2f} GB")
 
 
 if __name__ == '__main__':
@@ -267,7 +291,8 @@ if __name__ == '__main__':
     parser.add_argument("--max-length", type=int, default=2048, help="Maximum sequence length")
     parser.add_argument("--device", default="auto", help="Device placement")
     parser.add_argument("--no-resume", action="store_true", help="Don't resume from existing files")
-    parser.add_argument("--no-save-logits", action="store_true", help="Don't save logits")
+    parser.add_argument("--save-topk", type=int, default=20, help="Number of top probabilities to save")
+    parser.add_argument("--temperature", type=float, default=1.0, help="Temperature for teacher distribution")
     
     args = parser.parse_args()
     
@@ -278,5 +303,6 @@ if __name__ == '__main__':
         max_length=args.max_length,
         device=args.device,
         resume=not args.no_resume,
-        save_logits=not args.no_save_logits
+        save_topk=args.save_topk,
+        temperature=args.temperature
     )
