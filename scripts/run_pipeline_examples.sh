@@ -2,12 +2,12 @@
 set -e  # Exit on any error
 
 # Change to project directory
-cd /root/workspace/eagle
+cd /root/workspace
 
 # Activate virtual environment
 source ./v_eagle/bin/activate
 
-cd /root/workspace/eagle/eagle_v3_refactored
+cd /root/workspace/eagle
 
 # Install vLLM if needed
 pip install vllm --extra-index-url https://download.pytorch.org/whl/cu125

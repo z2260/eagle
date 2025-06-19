@@ -1,10 +1,2 @@
-__pycache__/
-EAGLE/
-ckpts/
-eagle_qwen_data/
-eagle_qwen_draft/
-eval_datasets/
-v_eagle/
-wandb/
-*.json
-*.log
+./eagle_qwen_data_v3
+*.py[cod]
