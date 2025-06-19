@@ -561,17 +561,31 @@ class EAGLE3InferenceUpdated:
         """Fuse features from multiple layers at a specific position."""
         n_layers = len(all_hidden_states) - 1  # Exclude embedding layer
         
-        # --- Start of Fix ---
-        # 使用统一的融合索引函数，确保与训练时一致
+        # --- 关键修复：确保与训练阶段使用相同的特征融合方式 ---
+        # 1. 统一使用get_fusion_indices函数，它在数据处理和训练中都被使用
+        # 2. 合理获取模型名称，以触发正确的分支逻辑（qwen或其他）
         try:
-            # 尝试从模型配置中获取模型名称
+            # 首先尝试从config._name_or_path获取模型名称
             model_name_for_fusion = self.base_model.config._name_or_path
+            # 对于某些加载方式，名称可能在其他属性中
+            if not model_name_for_fusion:
+                if hasattr(self.base_model.config, 'name_or_path'):
+                    model_name_for_fusion = self.base_model.config.name_or_path
+                elif hasattr(self.base_model.config, 'model_type'):
+                    model_name_for_fusion = self.base_model.config.model_type
         except AttributeError:
-            # 如果配置中没有，可以提供一个默认值或从参数传入
-            model_name_for_fusion = "qwen"  # 确保这里的关键字能触发正确的逻辑
+            # 回退方案，根据模型结构推测模型类型
+            if hasattr(self.base_model, 'model_type'):
+                model_name_for_fusion = self.base_model.model_type
+            else:
+                # 默认假设为qwen，这是可能的最常见情况
+                model_name_for_fusion = "qwen"
+            logger.warning(f"Couldn't detect model name, using {model_name_for_fusion} as fallback")
             
+        logger.info(f"Using model name '{model_name_for_fusion}' to determine fusion indices")
         indices = get_fusion_indices(model_name_for_fusion, n_layers)
-        # --- End of Fix ---
+        logger.info(f"Selected fusion layers: {indices} from {n_layers} total layers")
+        # --- 修复结束 ---
         
         # Check bounds
         max_pos = min(hs.shape[1] for hs in all_hidden_states)

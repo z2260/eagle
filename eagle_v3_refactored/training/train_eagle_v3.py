@@ -257,7 +257,8 @@ class TrainingConfig:
 
     # Loss weights
     token_loss_weight: float = 1.0
-    feature_loss_weight: float = 0.0
+    # EAGLE-3不使用特征回归损失，只关注词元预测，按照论文要求设为0
+    feature_loss_weight: float = 0.0  # 设为0表示完全不使用特征回归损失
 
     # Data augmentation
     use_noise: bool = True
@@ -722,106 +723,156 @@ class EagleDataset(Dataset):
         logger.info(f"Expected fused dimension: {self.expected_dim}")
 
     def _validate_sample(self, data: Dict) -> bool:
-        """Validate a data sample."""
-        required_fields = ["input_ids", "hidden_states"]
+        """Validate raw sample data."""
+        # Check required fields
+        required_fields = ['hidden_states', 'input_ids', 'attention_mask']
         for field in required_fields:
-            if field not in data or data[field] is None:
+            if field not in data:
+                logger.warning(f"Missing required field: {field}")
                 return False
         
-        # Check for NaN
-        if torch.isnan(data["hidden_states"]).any():
+        # Validate hidden_states tensor
+        hidden_states = data['hidden_states']
+        if not isinstance(hidden_states, torch.Tensor):
+            logger.warning(f"hidden_states is not a torch tensor: {type(hidden_states)}")
             return False
             
+        # Check for NaN values in hidden states
+        if torch.isnan(hidden_states).any() or torch.isinf(hidden_states).any():
+            logger.warning("NaN or Inf values found in hidden_states")
+            return False
+            
+        # Check hidden_states dimensions - expect last dim to be multiple of FUSE_LAYERS
+        if hidden_states.size(-1) % FUSE_LAYERS != 0:
+            logger.warning(f"Hidden states dim {hidden_states.size(-1)} is not divisible by FUSE_LAYERS={FUSE_LAYERS}")
+            # 不直接返回False，因为某些模型可能有特殊情况
+            
+        # 检查teacher数据的一致性
+        if 'teacher_topk_probs' in data and 'teacher_topk_indices' in data:
+            topk_probs = data['teacher_topk_probs']
+            topk_indices = data['teacher_topk_indices']
+            
+            # 确保两个张量匹配
+            if topk_probs.shape[:-1] != topk_indices.shape[:-1]:
+                logger.warning(f"Teacher data shape mismatch: {topk_probs.shape} vs {topk_indices.shape}")
+                return False
+                
+            # 检查概率是否是有效分布
+            if topk_probs.min() < 0 or topk_probs.max() > 1.1:  # 允许轻微浮点误差
+                logger.warning(f"Invalid probability values: min={topk_probs.min()}, max={topk_probs.max()}")
+                return False
+                
         return True
 
     def __len__(self):
         return len(self.files)
 
     def __getitem__(self, idx):
+        """Get a single sample."""
         try:
-            data = torch.load(self.files[idx], map_location="cpu")
+            # Try to load the sample
+            path = self.files[idx]
+            data = torch.load(path, map_location='cpu')
+            
+            # 更严格的数据质量验证：增强对fusion_features的检查
+            if not self._validate_sample(data):
+                logger.warning(f"Invalid sample detected at {path}, using dummy")
+                return self._get_dummy_sample()
+            
+            # Process the loaded sample
+            def squeeze_if_needed(t, keep_2d=True):
+                """Remove batch dimension if present."""
+                if t.dim() > 2 and t.size(0) == 1 and not keep_2d:
+                    return t.squeeze(0)
+                elif t.dim() == 1 and keep_2d:
+                    return t.unsqueeze(0)
+                else:
+                    return t
+            
+            # Extract fields
+            hidden_states = data.get('hidden_states')
+            input_ids = data.get('input_ids')
+            attention_mask = data.get('attention_mask')
+            
+            # 检查FUSION维度，确保与get_fusion_indices函数的输出匹配
+            num_fused_layers = data.get('num_fused_layers', FUSE_LAYERS)
+            if num_fused_layers != FUSE_LAYERS:
+                logger.warning(f"Fusion layers mismatch in {path}: {num_fused_layers} vs expected {FUSE_LAYERS}")
+            
+            # 检查并调整维度
+            hidden_states = squeeze_if_needed(hidden_states, keep_2d=False)
+            input_ids = squeeze_if_needed(input_ids)
+            attention_mask = squeeze_if_needed(attention_mask)
+            
+            # Take slice if too long
+            if self.max_seq_len > 0:
+                if hidden_states.size(0) > self.max_seq_len:
+                    end_idx = min(self.max_seq_len, hidden_states.size(0))
+                    hidden_states = hidden_states[:end_idx]
+                    input_ids = input_ids[:end_idx]
+                    attention_mask = attention_mask[:end_idx]
+                    
+                    # Update teacher data if present
+                    if 'teacher_topk_probs' in data and 'teacher_topk_indices' in data:
+                        data['teacher_topk_probs'] = data['teacher_topk_probs'][:end_idx]
+                        data['teacher_topk_indices'] = data['teacher_topk_indices'][:end_idx]
+            
+            # Apply data augmentation if specified
+            if self.augmentation is not None:
+                hidden_states = self.augmentation(hidden_states)
+
+            # Create loss mask (non-padding tokens)
+            loss_mask = attention_mask.clone()
+            
+            # Create sample
+            sample = {
+                'hidden_states': hidden_states,
+                'input_ids': input_ids,
+                'attention_mask': attention_mask,
+                'loss_mask': loss_mask,
+            }
+            
+            # Add teacher data if available
+            if 'teacher_topk_probs' in data and 'teacher_topk_indices' in data:
+                # 将教师模型的topk数据添加到样本中，进行适当的维度调整
+                teacher_topk_probs = squeeze_if_needed(data['teacher_topk_probs'], keep_2d=False)
+                teacher_topk_indices = squeeze_if_needed(data['teacher_topk_indices'], keep_2d=False)
+                
+                # 检查维度
+                if teacher_topk_probs.size(0) != input_ids.size(0):
+                    logger.warning(f"Teacher data length mismatch in {path}: {teacher_topk_probs.size(0)} vs {input_ids.size(0)}")
+                    # 调整维度以匹配
+                    min_len = min(teacher_topk_probs.size(0), input_ids.size(0))
+                    teacher_topk_probs = teacher_topk_probs[:min_len]
+                    teacher_topk_indices = teacher_topk_indices[:min_len]
+                    sample['input_ids'] = sample['input_ids'][:min_len]
+                    sample['attention_mask'] = sample['attention_mask'][:min_len]
+                    sample['loss_mask'] = sample['loss_mask'][:min_len]
+                    sample['hidden_states'] = sample['hidden_states'][:min_len]
+                
+                sample['teacher_topk_probs'] = teacher_topk_probs
+                sample['teacher_topk_indices'] = teacher_topk_indices
+                
+                # 检查词表ID是否在范围内
+                if teacher_topk_indices.max() >= self.vocab_size:
+                    logger.warning(f"Teacher token indices out of bounds in {path}: max={teacher_topk_indices.max()}, vocab_size={self.vocab_size}")
+                    # 将超出范围的ID替换为UNK或其他安全的ID
+                    mask = teacher_topk_indices >= self.vocab_size
+                    if mask.any():
+                        teacher_topk_indices[mask] = 0  # 替换为UNK或另一个安全值
+                        sample['teacher_topk_indices'] = teacher_topk_indices
+            
+            # 增强对输出样本的验证
+            if not self._validate_processed_sample(sample):
+                logger.warning(f"Processed sample validation failed for {path}, using dummy")
+                return self._get_dummy_sample()
+                
+            return sample
+            
         except Exception as e:
-            error_logger.error(f"Failed to load {self.files[idx]}: {e}")
-            # Return a dummy sample
+            logger.error(f"Error loading sample {idx} from {self.files[idx] if idx < len(self.files) else 'unknown'}: {e}")
             return self._get_dummy_sample()
-
-        def squeeze_if_needed(t, keep_2d=True):
-            if t is None:
-                return None
-            if t.dim() > 2 and t.size(0) == 1:
-                return t.squeeze(0)
-            if not keep_2d and t.dim() == 2 and t.size(0) == 1:
-                return t.squeeze(0)
-            return t
-
-        # Process fields
-        input_ids = squeeze_if_needed(data["input_ids"], keep_2d=False)
-        hidden_states = squeeze_if_needed(data["hidden_states"])
-        attention_mask = squeeze_if_needed(data.get("attention_mask", torch.ones_like(input_ids)), keep_2d=False)
-        loss_mask = squeeze_if_needed(data.get("loss_mask", torch.ones_like(input_ids)), keep_2d=False)
-
-        # Handle top-k fields with compatibility for both naming conventions
-        # First try teacher_topk_*, then try topk_*
-        topk_idx = data.get("teacher_topk_indices")
-        topk_prob = data.get("teacher_topk_probs")
-        
-        if topk_idx is None:
-            topk_idx = data.get("topk_indices")
-        if topk_prob is None:
-            topk_prob = data.get("topk_probs")
             
-        # Apply squeeze and provide defaults if still None
-        if topk_idx is not None:
-            topk_idx = squeeze_if_needed(topk_idx)
-        else:
-            topk_idx = torch.zeros((input_ids.size(0), 50), dtype=torch.long)
-            
-        if topk_prob is not None:
-            topk_prob = squeeze_if_needed(topk_prob)
-        else:
-            topk_prob = torch.ones((input_ids.size(0), 50)) / 50
-
-        # Get temperature (with compatibility)
-        teacher_temperature = data.get("teacher_temperature")
-        if teacher_temperature is None:
-            teacher_temperature = data.get("temperature", 1.0)
-
-        # Validate and fix dimensions
-        seq_len = min(input_ids.size(0), self.max_seq_len)
-        
-        # Ensure hidden states have correct dimension
-        if hidden_states.size(-1) != self.expected_dim:
-            error_logger.warning(f"Hidden states dimension mismatch: {hidden_states.size(-1)} vs expected {self.expected_dim}")
-            # Try to fix by padding or truncating
-            if hidden_states.size(-1) < self.expected_dim:
-                # Pad with zeros
-                pad_size = self.expected_dim - hidden_states.size(-1)
-                hidden_states = F.pad(hidden_states, (0, pad_size))
-            else:
-                # Truncate
-                hidden_states = hidden_states[..., :self.expected_dim]
-        
-        sample = {
-            "input_ids": input_ids[:seq_len],
-            "hidden_states": hidden_states[:seq_len],
-            "attention_mask": attention_mask[:seq_len],
-            "loss_mask": loss_mask[:seq_len],
-            "teacher_topk_indices": topk_idx[:seq_len],
-            "teacher_topk_probs": topk_prob[:seq_len],
-            "teacher_temperature": teacher_temperature,
-        }
-
-        # Apply augmentation
-        if self.augmentation:
-            sample["hidden_states"] = self.augmentation(sample["hidden_states"])
-
-        # Final validation
-        if not self._validate_processed_sample(sample):
-            error_logger.error(f"Invalid processed sample from {self.files[idx]}")
-            return self._get_dummy_sample()
-
-        return sample
-
     def _validate_processed_sample(self, sample: Dict) -> bool:
         """Validate processed sample."""
         seq_len = sample["input_ids"].size(0)
@@ -1148,48 +1199,36 @@ class TrainingTimeTest:
 
         # Current state tracking
         current_hidden = None
-        cumulative_position_offset = 0
+        current_input_ids = None
+        sampled_ids = None
+        is_fused = True  # 第一步使用融合特征
         nan_detected = False
 
         for step in range(self.num_steps):
             try:
                 if step == 0:
-                    # First step
+                    # 第一步：使用原始融合特征作为输入
                     seq_len_shifted = input_ids_shifted.shape[1]
                     position_ids = torch.arange(seq_len_shifted, dtype=torch.long, device=device).unsqueeze(0)
-
-                    logits, current_hidden = self.draft_model(
-                        hidden_states_shifted,
-                        input_ids=input_ids_shifted,
-                        attention_mask=attention_mask_shifted,
-                        position_ids=position_ids,
-                        is_fused_features=True,
-                        ttt_step=step,
-                    )
+                    current_hidden = hidden_states_shifted
+                    current_input_ids = input_ids_shifted
+                    current_attention_mask = attention_mask_shifted
                 else:
-                    # Subsequent steps
-                    sampled_ids = self._safe_sample(logits)
-                    current_seq_len = current_hidden.shape[1]
-                    
-                    position_ids = torch.arange(
-                        cumulative_position_offset,
-                        cumulative_position_offset + current_seq_len,
-                        dtype=torch.long,
-                        device=device
-                    ).unsqueeze(0)
+                    # 后续步骤：使用模型自己的输出作为输入（关键修复）
+                    is_fused = False
+                    # 使用上一步的预测作为当前步的输入ID
+                    current_input_ids = sampled_ids
+                    # 注意：current_hidden 已经在上一步更新
 
-                    current_attention_mask = torch.ones(batch_size, current_seq_len, device=device)
-
-                    logits, current_hidden = self.draft_model(
-                        current_hidden,
-                        input_ids=sampled_ids,
-                        attention_mask=current_attention_mask,
-                        position_ids=position_ids,
-                        is_fused_features=False,
-                        ttt_step=step,
-                    )
-                    
-                    cumulative_position_offset += 1
+                # 模型前向传播
+                logits, hidden_output = self.draft_model(
+                    current_hidden,
+                    input_ids=current_input_ids,
+                    attention_mask=current_attention_mask if step == 0 else None,
+                    position_ids=position_ids if step == 0 else None,
+                    is_fused_features=is_fused,
+                    ttt_step=step,
+                )
 
                 # Check for NaN
                 if torch.isnan(logits).any():
@@ -1197,94 +1236,69 @@ class TrainingTimeTest:
                     if self.config.skip_nan_batches:
                         nan_detected = True
                         break
-                    else:
-                        logits = torch.zeros_like(logits)
 
-                # Compute losses - Now everything is already shifted
-                valid_positions = loss_mask_shifted > 0
-                if valid_positions.any():
-                    # Cross-entropy loss - inputs are already aligned
-                    ce_loss = compute_ar_loss_robust(
+                # Compute cross-entropy loss
+                ce_loss = compute_ar_loss_robust(logits, target_ids, loss_mask_shifted, eps=self.config.eps)
+                
+                # Compute KL divergence loss if needed
+                kl_loss = torch.tensor(0.0, device=device)
+                if kl_weight > 0 and use_topk_kl and teacher_topk_indices_shifted is not None:
+                    kl_loss = compute_topk_kl_loss_robust(
                         logits,
-                        target_ids,
+                        teacher_topk_indices_shifted,
+                        teacher_topk_probs_shifted,
                         loss_mask_shifted,
+                        temperature=kl_temperature,
                         eps=self.config.eps
                     )
-
-                    # KL divergence loss
-                    kl_loss = torch.tensor(0.0, device=device, requires_grad=True)
-                    if kl_weight > 0 and use_topk_kl and teacher_topk_probs_shifted is not None:
-                        teacher_temp = teacher_temperature.item() if isinstance(teacher_temperature, torch.Tensor) else teacher_temperature
-                        
-                        kl_loss = compute_topk_kl_loss_robust(
-                            logits,
-                            teacher_topk_indices_shifted,
-                            teacher_topk_probs_shifted,
-                            loss_mask_shifted,
-                            temperature=teacher_temp,
-                            eps=self.config.eps
-                        )
-
-                    # Combined loss
-                    loss = ce_loss + kl_weight * kl_loss
-
-                    # Check for NaN in loss
-                    if torch.isnan(loss):
-                        nan_logger.error(f"NaN in loss at step {step}")
-                        if self.config.skip_nan_batches:
-                            nan_detected = True
-                            break
-                        else:
-                            loss = torch.tensor(0.0, device=device, requires_grad=True)
-
-                    # Apply step weight
-                    weighted_loss = loss * step_weights[step]
-                    total_loss = total_loss + weighted_loss
-                    total_ce_loss = total_ce_loss + ce_loss * step_weights[step]
-                    total_kl_loss = total_kl_loss + kl_loss * step_weights[step]
-
-                    step_losses.append(loss.item() if not torch.isnan(loss) else 0.0)
-
-                    # Compute accuracy
-                    with torch.no_grad():
-                        logits_flat = logits[valid_positions]
-                        targets_flat = target_ids[valid_positions]
-                        predictions = logits_flat.argmax(dim=-1)
-                        accuracy = (predictions == targets_flat).float().mean()
-                        step_accuracies.append(accuracy.item() if not torch.isnan(accuracy) else 0.0)
+                
+                # 计算加权总损失
+                loss = ce_loss + kl_weight * kl_loss
+                
+                # 更新累计损失
+                step_weight = step_weights[step]
+                total_loss = total_loss + loss * step_weight
+                total_ce_loss = total_ce_loss + ce_loss * step_weight
+                total_kl_loss = total_kl_loss + kl_loss * step_weight
+                
+                # 计算准确率
+                with torch.no_grad():
+                    correct = (logits.argmax(-1) == target_ids) & loss_mask_shifted.bool()
+                    accuracy = correct.sum().float() / max(loss_mask_shifted.sum(), 1)
+                    step_losses.append(loss.item())
+                    step_accuracies.append(accuracy.item())
+                
+                # 为下一步准备
+                with torch.no_grad():
+                    # 从当前步的logits中采样，用于下一步的输入
+                    sampled_ids = self._safe_sample(logits)
+                    # 关键：使用当前步的隐藏状态输出作为下一步的输入
+                    current_hidden = hidden_output.detach()
 
             except Exception as e:
-                error_logger.error(f"Error in TTT step {step}: {e}")
-                error_logger.error(traceback.format_exc())
+                nan_logger.error(f"Error in TTT forward step {step}: {e}")
                 if self.config.skip_nan_batches:
                     nan_detected = True
                     break
-
-        # Handle NaN detection
-        if nan_detected:
-            logger.warning("NaN detected, returning zero loss")
+        
+        if nan_detected and self.config.skip_nan_batches:
+            # 跳过有NaN的批次，返回零损失
             return {
                 'loss': torch.tensor(0.0, device=device, requires_grad=True),
-                'ce_loss': torch.tensor(0.0, device=device, requires_grad=True),
-                'kl_loss': torch.tensor(0.0, device=device, requires_grad=True),
+                'ce_loss': torch.tensor(0.0, device=device),
+                'kl_loss': torch.tensor(0.0, device=device),
                 'step_losses': [0.0] * self.num_steps,
                 'step_accuracies': [0.0] * self.num_steps,
                 'nan_detected': True,
             }
-
-        # Average over steps
-        num_valid_steps = max(len(step_losses), 1)
-        avg_loss = total_loss / num_valid_steps
-        avg_ce_loss = total_ce_loss / num_valid_steps
-        avg_kl_loss = total_kl_loss / num_valid_steps
-
+        
         return {
-            'loss': avg_loss,
-            'ce_loss': avg_ce_loss,
-            'kl_loss': avg_kl_loss,
+            'loss': total_loss,
+            'ce_loss': total_ce_loss,
+            'kl_loss': total_kl_loss,
             'step_losses': step_losses,
             'step_accuracies': step_accuracies,
-            'nan_detected': False,
+            'nan_detected': nan_detected,
         }
 
 
