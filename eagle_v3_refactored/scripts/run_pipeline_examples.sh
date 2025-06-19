@@ -7,6 +7,8 @@ cd /root/workspace/eagle
 # Activate virtual environment
 source ./v_eagle/bin/activate
 
+cd /root/workspace/eagle/eagle/eagle_v3_refactored
+
 # Install vLLM if needed
 pip install vllm --extra-index-url https://download.pytorch.org/whl/cu125
 pip install scikit-learn
@@ -22,7 +24,10 @@ BASE_MODEL_PATH="/root/workspace/TensorRT-LLM/workspace/model/Qwen3-32B"
 TEACHER_MODEL_PATH="/root/workspace/TensorRT-LLM/workspace/model/Qwen3-32B"
 OUTPUT_DIR="./eagle_qwen_data_v3"
 VLLM_PORT=8500
-EVAL_SPLIT_RATIO=0.05  # 5% for evaluation
+EVAL_SPLIT_RATIO=0.05
+BATCH_SIZE=4
+TEMPERATURE=0.0 
+VOCAB_SIZE=151936
 
 # ===== UTILITY FUNCTIONS =====
 
@@ -72,7 +77,7 @@ sleep 5
 
 # ===== STAGE 1: BUILD DATASET WITH SPLIT =====
 echo -e "${YELLOW}=== STAGE 1: Building and splitting dataset ===${NC}"
-python eagle_data_pipeline.py \
+python ./data/eagle_data_pipeline.py \
     --stage build \
     --spec "openai/gsm8k:main:20000,tatsu-lab/alpaca:20000,anthropic/hh-rlhf:40000,openai/webgpt_comparisons:20000" \
     --output-dir "$OUTPUT_DIR" \
@@ -85,7 +90,7 @@ echo -e "${YELLOW}=== STAGE 2: Extracting base model features and logits ===${NC
 
 # Process training data
 echo "Processing training data..."
-python eagle_data_pipeline.py \
+python ./data/eagle_data_pipeline.py \
     --stage extract_base \
     --base-model "$BASE_MODEL_PATH" \
     --prompts-dir "${OUTPUT_DIR}/prompts/train" \
@@ -94,12 +99,12 @@ python eagle_data_pipeline.py \
     --device "cuda" \
     --num-gpus 8 \
     --save-topk 64 \
-    --teacher-temperature 1.0 \
+    --teacher-temperature $TEMPERATURE \
     --resume
 
 # Process evaluation data
 echo "Processing evaluation data..."
-python eagle_data_pipeline.py \
+python ./data/eagle_data_pipeline.py \
     --stage extract_base \
     --base-model "$BASE_MODEL_PATH" \
     --prompts-dir "${OUTPUT_DIR}/prompts/eval" \
@@ -108,86 +113,86 @@ python eagle_data_pipeline.py \
     --device "cuda" \
     --num-gpus 8 \
     --save-topk 64 \
-    --teacher-temperature 1.0 \
+    --teacher-temperature $TEMPERATURE \
     --resume
 
-# ===== STAGE 3: EXTRACT TEACHER FEATURES (OPTIONAL) =====
-if [ -n "$TEACHER_MODEL_PATH" ]; then
-    echo -e "${YELLOW}=== STAGE 3: Extracting teacher features ===${NC}"
+# # ===== STAGE 3: EXTRACT TEACHER FEATURES (OPTIONAL) =====
+# if [ -n "$TEACHER_MODEL_PATH" ]; then
+#     echo -e "${YELLOW}=== STAGE 3: Extracting teacher features ===${NC}"
     
-    # Start vLLM server
-    echo "Starting vLLM API server..."
-    nohup python3 -m vllm.entrypoints.openai.api_server \
-        --model "$TEACHER_MODEL_PATH" \
-        --port $VLLM_PORT \
-        --gpu-memory-utilization 0.8 \
-        --dtype bfloat16 \
-        --tensor-parallel-size 8 > vllm_server.log 2>&1 &
+#     # Start vLLM server
+#     echo "Starting vLLM API server..."
+#     nohup python3 -m vllm.entrypoints.openai.api_server \
+#         --model "$TEACHER_MODEL_PATH" \
+#         --port $VLLM_PORT \
+#         --gpu-memory-utilization 0.8 \
+#         --dtype bfloat16 \
+#         --tensor-parallel-size 8 > vllm_server.log 2>&1 &
     
-    VLLM_PID=$!
-    echo "vLLM server started with PID: $VLLM_PID"
+#     VLLM_PID=$!
+#     echo "vLLM server started with PID: $VLLM_PID"
     
-    # Wait for server to be ready
-    echo "Waiting for vLLM server to start..."
-    for i in {1..150}; do
-        if curl -s http://localhost:$VLLM_PORT/v1/models > /dev/null 2>&1; then
-            echo -e "${GREEN}vLLM server is ready!${NC}"
-            break
-        fi
-        echo -ne "Waiting... $i/150\r"
-        sleep 1
-    done
+#     # Wait for server to be ready
+#     echo "Waiting for vLLM server to start..."
+#     for i in {1..150}; do
+#         if curl -s http://localhost:$VLLM_PORT/v1/models > /dev/null 2>&1; then
+#             echo -e "${GREEN}vLLM server is ready!${NC}"
+#             break
+#         fi
+#         echo -ne "Waiting... $i/150\r"
+#         sleep 1
+#     done
     
-    # Extract teacher features for training data
-    echo "Extracting teacher features for training data..."
-    python eagle_data_pipeline.py \
-        --stage extract_teacher \
-        --teacher-model "$TEACHER_MODEL_PATH" \
-        --teacher-url "http://localhost:$VLLM_PORT/v1/completions" \
-        --prompts-dir "${OUTPUT_DIR}/prompts/train" \
-        --output-dir "${OUTPUT_DIR}/teacher_features/train" \
-        --teacher-k 20 \
-        --concurrency 16 \
-        --resume
+#     # Extract teacher features for training data
+#     echo "Extracting teacher features for training data..."
+#     python ./data/eagle_data_pipeline.py \
+#         --stage extract_teacher \
+#         --teacher-model "$TEACHER_MODEL_PATH" \
+#         --teacher-url "http://localhost:$VLLM_PORT/v1/completions" \
+#         --prompts-dir "${OUTPUT_DIR}/prompts/train" \
+#         --output-dir "${OUTPUT_DIR}/teacher_features/train" \
+#         --teacher-k 20 \
+#         --concurrency 16 \
+#         --resume
     
-    # Extract teacher features for evaluation data
-    echo "Extracting teacher features for evaluation data..."
-    python eagle_data_pipeline.py \
-        --stage extract_teacher \
-        --teacher-model "$TEACHER_MODEL_PATH" \
-        --teacher-url "http://localhost:$VLLM_PORT/v1/completions" \
-        --prompts-dir "${OUTPUT_DIR}/prompts/eval" \
-        --output-dir "${OUTPUT_DIR}/teacher_features/eval" \
-        --teacher-k 20 \
-        --concurrency 16 \
-        --resume
+#     # Extract teacher features for evaluation data
+#     echo "Extracting teacher features for evaluation data..."
+#     python eagle_data_pipeline.py \
+#         --stage extract_teacher \
+#         --teacher-model "$TEACHER_MODEL_PATH" \
+#         --teacher-url "http://localhost:$VLLM_PORT/v1/completions" \
+#         --prompts-dir "${OUTPUT_DIR}/prompts/eval" \
+#         --output-dir "${OUTPUT_DIR}/teacher_features/eval" \
+#         --teacher-k 20 \
+#         --concurrency 16 \
+#         --resume
     
-    # Kill vLLM server
-    echo "Shutting down vLLM server..."
-    kill $VLLM_PID
-    sleep 5
+#     # Kill vLLM server
+#     echo "Shutting down vLLM server..."
+#     kill $VLLM_PID
+#     sleep 5
     
-    # ===== STAGE 4: MERGE FEATURES =====
-    echo -e "${YELLOW}=== STAGE 4: Merging features ===${NC}"
+#     # ===== STAGE 4: MERGE FEATURES =====
+#     echo -e "${YELLOW}=== STAGE 4: Merging features ===${NC}"
     
-    # Merge training features
-    python eagle_data_pipeline.py \
-        --stage merge \
-        --base-dir "${OUTPUT_DIR}/base_features/train" \
-        --teacher-dir "${OUTPUT_DIR}/teacher_features/train" \
-        --output-dir "${OUTPUT_DIR}/final_features/train"
+#     # Merge training features
+#     python eagle_data_pipeline.py \
+#         --stage merge \
+#         --base-dir "${OUTPUT_DIR}/base_features/train" \
+#         --teacher-dir "${OUTPUT_DIR}/teacher_features/train" \
+#         --output-dir "${OUTPUT_DIR}/final_features/train"
     
-    # Merge evaluation features
-    python eagle_data_pipeline.py \
-        --stage merge \
-        --base-dir "${OUTPUT_DIR}/base_features/eval" \
-        --teacher-dir "${OUTPUT_DIR}/teacher_features/eval" \
-        --output-dir "${OUTPUT_DIR}/final_features/eval"
-else
-    echo -e "${YELLOW}=== No teacher model specified, using base features only ===${NC}"
-    cp -r "${OUTPUT_DIR}/base_features/train" "${OUTPUT_DIR}/final_features/train"
-    cp -r "${OUTPUT_DIR}/base_features/eval" "${OUTPUT_DIR}/final_features/eval"
-fi
+#     # Merge evaluation features
+#     python eagle_data_pipeline.py \
+#         --stage merge \
+#         --base-dir "${OUTPUT_DIR}/base_features/eval" \
+#         --teacher-dir "${OUTPUT_DIR}/teacher_features/eval" \
+#         --output-dir "${OUTPUT_DIR}/final_features/eval"
+# else
+#     echo -e "${YELLOW}=== No teacher model specified, using base features only ===${NC}"
+#     cp -r "${OUTPUT_DIR}/base_features/train" "${OUTPUT_DIR}/final_features/train"
+#     cp -r "${OUTPUT_DIR}/base_features/eval" "${OUTPUT_DIR}/final_features/eval"
+# fi
 
 # ===== STAGE 5: TRAIN EAGLE MODEL =====
 echo -e "${YELLOW}=== STAGE 5: Training EAGLE model ===${NC}"
@@ -230,7 +235,7 @@ python eagle_v3_eval.py \
     --data_path "./eval_datasets/gsm8k_test.jsonl" \
     --num_samples 36 \
     --max_new_tokens 1024 \
-    --temperature 0.0 \
+    --temperature $TEMPERATURE \
     --output_file results_gsm8k_greedy_quick.json
 
 echo -e "${GREEN}=== All tasks completed successfully! ===${NC}"
