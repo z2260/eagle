@@ -5,13 +5,14 @@ set -e  # Exit on any error
 cd /root/workspace
 
 # Activate virtual environment
-source ./v_eagle/bin/activate
+source /root/workspace/v_eagle/bin/activate
 
 cd /root/workspace/eagle
 
 # Install vLLM if needed
 pip install vllm --extra-index-url https://download.pytorch.org/whl/cu125
-pip install scikit-learn
+pip install scikit-learn datasets transformers accelerate tqdm wandb deepspeed
+
 
 # Color codes for output
 RED='\033[0;31m'
@@ -76,10 +77,19 @@ cleanup_port $VLLM_PORT
 sleep 5
 
 # ===== STAGE 1: BUILD DATASET WITH SPLIT =====
+# echo -e "${YELLOW}=== STAGE 1: Building and splitting dataset ===${NC}"
+# python3 ./data/eagle_data_pipeline.py \
+#     --stage build \
+#     --spec "openai/gsm8k:main:20000,tatsu-lab/alpaca:20000,anthropic/hh-rlhf:40000,openai/webgpt_comparisons:20000" \
+#     --output-dir "$OUTPUT_DIR" \
+#     --eval-split-ratio $EVAL_SPLIT_RATIO \
+#     --cn-weight 0.0 \
+#     --seed 42
+
 echo -e "${YELLOW}=== STAGE 1: Building and splitting dataset ===${NC}"
-python ./data/eagle_data_pipeline.py \
+python3 ./data/eagle_data_pipeline.py \
     --stage build \
-    --spec "openai/gsm8k:main:20000,tatsu-lab/alpaca:20000,anthropic/hh-rlhf:40000,openai/webgpt_comparisons:20000" \
+    --spec "openai/gsm8k:main:20000,tatsu-lab/alpaca:20000" \
     --output-dir "$OUTPUT_DIR" \
     --eval-split-ratio $EVAL_SPLIT_RATIO \
     --cn-weight 0.0 \
@@ -90,7 +100,7 @@ echo -e "${YELLOW}=== STAGE 2: Extracting base model features and logits ===${NC
 
 # Process training data
 echo "Processing training data..."
-python ./data/eagle_data_pipeline.py \
+python3 ./data/eagle_data_pipeline.py \
     --stage extract_base \
     --base-model "$BASE_MODEL_PATH" \
     --prompts-dir "${OUTPUT_DIR}/prompts/train" \
@@ -104,7 +114,7 @@ python ./data/eagle_data_pipeline.py \
 
 # Process evaluation data
 echo "Processing evaluation data..."
-python ./data/eagle_data_pipeline.py \
+python3 ./data/eagle_data_pipeline.py \
     --stage extract_base \
     --base-model "$BASE_MODEL_PATH" \
     --prompts-dir "${OUTPUT_DIR}/prompts/eval" \
@@ -145,7 +155,7 @@ python ./data/eagle_data_pipeline.py \
     
 #     # Extract teacher features for training data
 #     echo "Extracting teacher features for training data..."
-#     python ./data/eagle_data_pipeline.py \
+#     python3 ./data/eagle_data_pipeline.py \
 #         --stage extract_teacher \
 #         --teacher-model "$TEACHER_MODEL_PATH" \
 #         --teacher-url "http://localhost:$VLLM_PORT/v1/completions" \
@@ -157,7 +167,7 @@ python ./data/eagle_data_pipeline.py \
     
 #     # Extract teacher features for evaluation data
 #     echo "Extracting teacher features for evaluation data..."
-#     python eagle_data_pipeline.py \
+#     python3 eagle_data_pipeline.py \
 #         --stage extract_teacher \
 #         --teacher-model "$TEACHER_MODEL_PATH" \
 #         --teacher-url "http://localhost:$VLLM_PORT/v1/completions" \
@@ -176,14 +186,14 @@ python ./data/eagle_data_pipeline.py \
 #     echo -e "${YELLOW}=== STAGE 4: Merging features ===${NC}"
     
 #     # Merge training features
-#     python eagle_data_pipeline.py \
+#     python3 eagle_data_pipeline.py \
 #         --stage merge \
 #         --base-dir "${OUTPUT_DIR}/base_features/train" \
 #         --teacher-dir "${OUTPUT_DIR}/teacher_features/train" \
 #         --output-dir "${OUTPUT_DIR}/final_features/train"
     
 #     # Merge evaluation features
-#     python eagle_data_pipeline.py \
+#     python3 eagle_data_pipeline.py \
 #         --stage merge \
 #         --base-dir "${OUTPUT_DIR}/base_features/eval" \
 #         --teacher-dir "${OUTPUT_DIR}/teacher_features/eval" \
@@ -200,18 +210,13 @@ echo -e "${YELLOW}=== STAGE 5: Training EAGLE model ===${NC}"
 # Note: We no longer need --base_model parameter!
 # You'll need to add --vocab_size and --hidden_size based on your model
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
-<<<<<<< HEAD
-accelerate launch train_eagle_v3.py \
-    --data_path "./eagle_qwen_data_v3/final_features/train" \
-=======
 accelerate launch training/train_eagle_v3.py \
     --data_path "./eagle_qwen_data_v3/base_features/train" \
->>>>>>> db3bdfab9e9ccd80be80c1a218cae4e8f83f79a4
     --output_dir "./eagle_qwen_draft_v3" \
     --vocab_size 151936 \
     --hidden_size 5120 \
-    --batch_size 2 \
-    --lr 1e-5 \
+    --batch_size 8 \
+    --lr 5e-4 \
     --epochs 10 \
     --max_seq_len 2048 \
     --ttt_steps 3 \
@@ -226,14 +231,14 @@ accelerate launch training/train_eagle_v3.py \
 
 # ===== STAGE 6: PREPARE EVALUATION DATASETS =====
 echo -e "${YELLOW}=== STAGE 6: Preparing evaluation datasets ===${NC}"
-python prepare_eval_datasets.py
+python3 prepare_eval_datasets.py
 
 # ===== STAGE 7: RUN EVALUATION =====
 echo -e "${YELLOW}=== STAGE 7: Running evaluation ===${NC}"
 
 # Quick test with 2 samples
 echo "Running quick evaluation..."
-python eagle_v3_eval.py \
+python3 eagle_v3_eval.py \
     --base_model /root/workspace/TensorRT-LLM/workspace/model/Qwen3-32B \
     --draft_ckpt "./eagle_qwen_draft_v3/final/" \
     --dataset gsm8k \

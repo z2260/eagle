@@ -34,11 +34,8 @@ from eagle_core import get_fusion_indices, fuse_hidden_states, FUSE_LAYERS
 # We'll import the actual functions rather than copying them
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-<<<<<<< HEAD
-from eagle_v3_refactored.data.build_dataset import build_dataset
-=======
+# Not: from eagle_core import get_fusion_indices, fuse_hidden_states, FUSE_LAYERS
 from data.build_dataset import build_dataset
->>>>>>> db3bdfab9e9ccd80be80c1a218cae4e8f83f79a4
 
 logging.basicConfig(
     format="%(levelname)s | %(asctime)s | %(message)s",
@@ -154,7 +151,7 @@ def extract_base_features_worker(args_tuple):
                         'attention_mask': attention_mask_squeezed,
                         'prompt': text,
                         'prompt_id': prompt_id,
-                        'temperature': temperature,
+                        'teacher_temperature': temperature,
                         'save_topk': save_topk
                     }
                     
@@ -558,7 +555,7 @@ def extract_base_features_simple(model_name: str, prompts_dir: str, output_dir: 
                             'attention_mask': attention_mask_squeezed,
                             'prompt': text,
                             'prompt_id': prompt_id,
-                            'temperature': temperature,
+                            'teacher_temperature': temperature,
                             'save_topk': save_topk
                         }
                         
@@ -705,7 +702,7 @@ def extract_base_features_threaded(model_name: str, prompts_dir: str, output_dir
                     'attention_mask': attention_mask_squeezed,
                     'prompt': text,
                     'prompt_id': prompt_id,
-                    'temperature': temperature,
+                    'teacher_temperature': temperature,
                     'save_topk': save_topk
                 }
                 

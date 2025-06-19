@@ -1,2 +1,4 @@
-./eagle_qwen_data_v3
+eagle_qwen_data_v3/
+eagle_qwen_draft_v3/
 *.py[cod]
+*.log
