@@ -216,7 +216,7 @@ accelerate launch training/train_eagle_v3.py \
     --vocab_size 151936 \
     --hidden_size 5120 \
     --batch_size 8 \
-    --lr 5e-4 \
+    --lr 5e-5 \
     --epochs 10 \
     --max_seq_len 2048 \
     --ttt_steps 3 \

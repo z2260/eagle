@@ -833,6 +833,7 @@ class EagleDataset(Dataset):
                 'input_ids': input_ids,
                 'attention_mask': attention_mask,
                 'loss_mask': loss_mask,
+                'teacher_temperature': data.get('teacher_temperature', 1.0)
             }
             
             # Add teacher data if available
@@ -971,7 +972,7 @@ def collate_fn(samples: List[Dict]) -> Dict[str, torch.Tensor]:
 # 4️⃣  Training Logic (Fixed dimension issues)
 #------------------------------------------------------------------
 
-def compute_ar_loss_robust(logits: torch.Tensor, targets: torch.Tensor, 
+def compute_ar_loss(logits: torch.Tensor, targets: torch.Tensor, 
                           loss_mask: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """
     Compute autoregressive loss with numerical stability.
@@ -1009,94 +1010,122 @@ def compute_ar_loss_robust(logits: torch.Tensor, targets: torch.Tensor,
         return torch.tensor(0.0, device=logits.device, requires_grad=True)
 
 
+def compute_ar_loss_robust(logits: torch.Tensor, targets: torch.Tensor, 
+                           loss_mask: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Compute autoregressive loss with numerical stability and label smoothing.
+    Note: This function expects already shifted inputs!
+    """
+    # 确保维度匹配
+    assert logits.size(0) == targets.size(0), f"Batch size mismatch: {logits.size(0)} vs {targets.size(0)}"
+    assert logits.size(1) == targets.size(1), f"Sequence length mismatch: {logits.size(1)} vs {targets.size(1)}"
+    assert logits.size(1) == loss_mask.size(1), f"Loss mask length mismatch: {logits.size(1)} vs {loss_mask.size(1)}"
+    
+    # 只在有效位置计算损失
+    valid_positions = loss_mask > 0
+    num_valid = valid_positions.sum()
+    
+    if num_valid > 0:
+        logits_flat = logits[valid_positions]
+        targets_flat = targets[valid_positions]
+        
+        # 使用带标签平滑的交叉熵以增强稳定性
+        loss = F.cross_entropy(logits_flat, targets_flat, label_smoothing=0.1)
+        
+        if torch.isnan(loss) or torch.isinf(loss):
+            nan_logger.error("NaN/Inf in AR loss calculation.")
+            nan_logger.error(f"Logits stats: min={logits_flat.min()}, max={logits_flat.max()}")
+            nan_logger.error(f"Targets unique: {targets_flat.unique()}")
+            return torch.tensor(0.0, device=logits.device, requires_grad=True)
+            
+        return loss
+    else:
+        # 如果没有有效的目标，返回0损失
+        return torch.tensor(0.0, device=logits.device, requires_grad=True)
+
+
 def compute_topk_kl_loss_robust(
     student_logits: torch.Tensor,
     teacher_topk_indices: torch.Tensor,
     teacher_topk_probs: torch.Tensor,
     loss_mask: torch.Tensor,
     temperature: float = 1.0,
-    eps: float = 1e-8
+    eps: float = 1e-9 # 使用一个更小的eps
 ) -> torch.Tensor:
     """
-    Compute KL divergence using top-k teacher probabilities with numerical stability.
-    Note: All inputs should be already aligned (no shifting needed)
+    Compute KL divergence using top-k teacher probabilities with ultimate robustness.
+    If temperature is near zero, it switches to cross-entropy loss against the argmax target.
+    Handles the 0 * log(0) = NaN issue using torch.nan_to_num for guaranteed stability.
     """
-    # Ensure dimensions match
-    assert student_logits.size(0) == teacher_topk_indices.size(0)
-    assert student_logits.size(1) == teacher_topk_indices.size(1)
-    assert student_logits.size(1) == loss_mask.size(1)
-    
-    # Clamp temperature
-    temperature = max(temperature, 0.1)
-    
-    # Apply temperature to student logits with clamping
-    student_logits_scaled = student_logits / temperature
-    student_logits_scaled = torch.clamp(student_logits_scaled, min=-50, max=50)
-    
-    # Compute student log probabilities with stability
-    student_log_probs = F.log_softmax(student_logits_scaled, dim=-1)
-    
-    # Ensure no NaN in log probs
-    if torch.isnan(student_log_probs).any():
-        nan_logger.error("NaN in student log probs")
-        return torch.tensor(0.0, device=student_logits.device, requires_grad=True)
-    
-    # Gather student log probs for teacher's top-k tokens
-    student_topk_log_probs = torch.gather(
-        student_log_probs,
-        dim=-1,
-        index=teacher_topk_indices.long()
-    )
-    
-    # Ensure teacher probs are valid
-    teacher_topk_probs = torch.clamp(teacher_topk_probs, min=eps, max=1.0)
-    teacher_topk_probs = teacher_topk_probs / teacher_topk_probs.sum(dim=-1, keepdim=True).clamp(min=eps)
-    
-    # Compute probability mass not in top-k
-    teacher_topk_mass = teacher_topk_probs.sum(dim=-1, keepdim=True)
-    teacher_rest_mass = torch.clamp(1.0 - teacher_topk_mass, min=eps)
-    
-    # For student, compute log probability of "rest" tokens
-    vocab_size = student_logits_scaled.size(-1)
-    topk_mask = torch.zeros_like(student_logits_scaled, dtype=torch.bool)
-    topk_mask.scatter_(dim=-1, index=teacher_topk_indices.long(), value=True)
-    
-    student_logits_rest = student_logits_scaled.masked_fill(topk_mask, float('-inf'))
-    student_rest_log_prob = torch.logsumexp(student_logits_rest, dim=-1, keepdim=True)
-    
-    # Replace -inf with large negative value
-    student_rest_log_prob = torch.clamp(student_rest_log_prob, min=-50)
-    
-    # Compute KL divergence for top-k tokens
-    kl_topk = teacher_topk_probs * (
-        torch.log(teacher_topk_probs + eps) - student_topk_log_probs
-    )
-    
-    # Compute KL divergence for rest mass
-    kl_rest = teacher_rest_mass * (
-        torch.log(teacher_rest_mass + eps) - student_rest_log_prob
-    )
-    
-    # Sum and apply mask
-    kl_per_token = kl_topk.sum(dim=-1) + kl_rest.squeeze(-1)
-    kl_per_token = kl_per_token * loss_mask
-    
-    # Check for NaN
-    if torch.isnan(kl_per_token).any():
-        nan_logger.error("NaN in KL loss computation")
-        return torch.tensor(0.0, device=student_logits.device, requires_grad=True)
-    
-    # Average over valid tokens
-    num_valid_tokens = loss_mask.sum()
-    if num_valid_tokens > 0:
-        kl_loss = kl_per_token.sum() / num_valid_tokens
+    # --- 开始修改 ---
+    if temperature < 1e-4:
+        # 温度为0或接近0，切换到交叉熵损失，这是最稳健的做法
+        nan_logger.debug("Temperature is near zero, switching to Cross-Entropy for KL loss computation.")
+        # 取top-1的索引作为正确答案
+        hard_targets = teacher_topk_indices[:, :, 0]
+        # 使用健壮的交叉熵损失函数
+        return compute_ar_loss_robust(student_logits, hard_targets, loss_mask, eps=eps)
+
     else:
-        kl_loss = torch.tensor(0.0, device=student_logits.device, requires_grad=True)
-    
-    # Scale by temperature squared
-    kl_loss = kl_loss * (temperature ** 2)
-    
-    return kl_loss
+        # 温度为正，计算KL散度
+        # 限制温度范围防止除以过小的数
+        temperature = max(temperature, 0.1)
+        
+        # 缩放并限制学生模型的logits以增强稳定性
+        student_logits_scaled = student_logits / temperature
+        student_logits_scaled = torch.clamp(student_logits_scaled, min=-50, max=50)
+        
+        # 计算学生模型的对数概率
+        student_log_probs = F.log_softmax(student_logits_scaled, dim=-1)
+        
+        if torch.isnan(student_log_probs).any():
+            nan_logger.error("NaN detected in student log probabilities.")
+            return torch.tensor(0.0, device=student_logits.device, requires_grad=True)
+
+        # 收集学生模型在教师模型top-k位置上的对数概率
+        student_topk_log_probs = torch.gather(
+            student_log_probs,
+            dim=-1,
+            index=teacher_topk_indices.long()
+        )
+
+        # 对教师概率进行归一化，确保它们在k维上和为1
+        teacher_topk_probs = F.normalize(teacher_topk_probs, p=1, dim=-1)
+
+        # --- 核心修复：使用 torch.nan_to_num 来保证数值稳定 ---
+        # KL散度公式 P * (log(P) - log(Q)) 在 P=0 时会导致 0 * -inf = NaN
+        
+        # 安全地计算 log(P)，在log内部加eps防止log(0)
+        teacher_log_probs = torch.log(teacher_topk_probs + eps)
+
+        # 计算KL散度的每个分项
+        kl_term = teacher_topk_probs * (teacher_log_probs - student_topk_log_probs)
+
+        # 这是关键一步：将计算中产生的任何NaN值替换为0.0
+        # 这完美处理了 0 * -inf 的情况
+        kl_topk = torch.nan_to_num(kl_term, nan=0.0)
+        
+        # 对top-k维度求和，得到每个token的KL散度
+        kl_per_token = kl_topk.sum(dim=-1)
+        
+        # 应用损失掩码
+        kl_per_token = kl_per_token * loss_mask
+        
+        if torch.isnan(kl_per_token).any():
+            nan_logger.error("NaN persisted in KL loss even after nan_to_num. This is unexpected. Check inputs.")
+            return torch.tensor(0.0, device=student_logits.device, requires_grad=True)
+
+        # 在有效token上求平均
+        num_valid_tokens = loss_mask.sum()
+        if num_valid_tokens > 0:
+            kl_loss = kl_per_token.sum() / num_valid_tokens
+        else:
+            kl_loss = torch.tensor(0.0, device=student_logits.device, requires_grad=True)
+        
+        # 根据知识蒸馏理论，乘以温度的平方
+        kl_loss = kl_loss * (temperature ** 2)
+        
+        return kl_loss
 
 
 class TrainingTimeTest:
@@ -1241,19 +1270,19 @@ class TrainingTimeTest:
                         break
 
                 # Compute cross-entropy loss
-                ce_loss = compute_ar_loss_robust(logits, target_ids, loss_mask_shifted, eps=self.config.eps)
+                ce_loss = compute_ar_loss(logits, target_ids, loss_mask_shifted, eps=self.config.eps)
                 
                 # Compute KL divergence loss if needed
                 kl_loss = torch.tensor(0.0, device=device)
                 if kl_weight > 0 and use_topk_kl and teacher_topk_indices_shifted is not None:
-                    kl_loss = compute_topk_kl_loss_robust(
-                        logits,
-                        teacher_topk_indices_shifted,
-                        teacher_topk_probs_shifted,
-                        loss_mask_shifted,
-                        temperature=kl_temperature,
-                        eps=self.config.eps
-                    )
+                                    kl_loss = compute_topk_kl_loss_robust(
+                    logits,
+                    teacher_topk_indices_shifted,
+                    teacher_topk_probs_shifted,
+                    loss_mask_shifted,
+                    temperature=kl_temperature,
+                    eps=self.config.eps
+                )
                 
                 # 计算加权总损失
                 loss = ce_loss + kl_weight * kl_loss
@@ -1523,7 +1552,7 @@ class EagleTrainer:
         valid_positions = loss_mask_shifted > 0
         if valid_positions.any():
             # CE loss - already shifted
-            ce_loss = compute_ar_loss_robust(
+            ce_loss = compute_ar_loss(
                 logits, 
                 target_ids, 
                 loss_mask_shifted,
@@ -1635,7 +1664,7 @@ class EagleTrainer:
                 
                 valid_positions = loss_mask > 0
                 if valid_positions.any():
-                    loss = compute_ar_loss_robust(
+                    loss = compute_ar_loss(
                         logits,
                         targets,
                         loss_mask,
