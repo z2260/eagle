@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 """
 eagle_data_pipeline.py - Fixed multiprocessing Queue sharing with top-k probability extraction
-修复字段命名和维度一致性问题
 """
 
 import argparse
@@ -27,18 +26,10 @@ import torch.nn.functional as F
 import httpx
 from tqdm import tqdm
 
-# Import from eagle_core for consistency
-sys.path.append(str(pathlib.Path(__file__).parent.parent))
-from eagle_core import get_fusion_indices, fuse_hidden_states, FUSE_LAYERS
-
 # We'll import the actual functions rather than copying them
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-<<<<<<< HEAD
-from eagle_v3_refactored.data.build_dataset import build_dataset
-=======
-from data.build_dataset import build_dataset
->>>>>>> db3bdfab9e9ccd80be80c1a218cae4e8f83f79a4
+from build_dataset import build_dataset
 
 logging.basicConfig(
     format="%(levelname)s | %(asctime)s | %(message)s",
@@ -115,43 +106,24 @@ def extract_base_features_worker(args_tuple):
                     outputs = model(**inputs, output_hidden_states=True)
                     
                     # Extract features
-                    fusion_indices = get_fusion_indices(model_name, model.config.num_hidden_layers)
-                    fused_features = fuse_hidden_states(outputs.hidden_states, fusion_indices)
+                    hidden_states = outputs.hidden_states[-1]  # Last layer
                     logits = outputs.logits
                     
                     # Apply temperature scaling and get top-k probabilities
-                    # scaled_logits = logits / temperature
-                    scaled_logits = logits.to(torch.float32) / temperature
-                    scaled_logits = scaled_logits - scaled_logits.max(dim=-1, keepdim=True).values
-                    probs = F.softmax(scaled_logits, dim=-1).to(torch.float16)
-
+                    scaled_logits = logits / temperature
+                    probs = F.softmax(scaled_logits, dim=-1)
                     
                     # Get top-k probabilities and indices for each position
                     topk_probs, topk_indices = torch.topk(probs, k=save_topk, dim=-1)
                     
-                    # ===== 关键修复：统一维度处理，去掉 batch 维度 =====
-                    # 确保所有张量的第一个维度都是序列长度，而不是batch
-                    input_ids_squeezed = inputs['input_ids'][0].cpu()  # [seq_len]
-                    attention_mask_squeezed = inputs['attention_mask'][0].cpu()  # [seq_len]
-                    fused_features_squeezed = fused_features.cpu()  # [seq_len, hidden_dim] (已经去掉了batch维度)
-                    topk_probs_squeezed = topk_probs[0].cpu()  # [seq_len, k]
-                    topk_indices_squeezed = topk_indices[0].cpu()  # [seq_len, k]
-                    
-                    # 添加一致性断言，确保所有张量的序列长度一致
-                    seq_len = input_ids_squeezed.size(0)
-                    assert attention_mask_squeezed.size(0) == seq_len, f"attention_mask length mismatch: {attention_mask_squeezed.size(0)} != {seq_len}"
-                    assert fused_features_squeezed.size(0) == seq_len, f"fused_features length mismatch: {fused_features_squeezed.size(0)} != {seq_len}"
-                    assert topk_probs_squeezed.size(0) == seq_len, f"topk_probs length mismatch: {topk_probs_squeezed.size(0)} != {seq_len}"
-                    assert topk_indices_squeezed.size(0) == seq_len, f"topk_indices length mismatch: {topk_indices_squeezed.size(0)} != {seq_len}"
-                    
-                    # ===== 关键修复：字段命名与训练脚本保持一致 =====
+                    # Save features (move to CPU to save GPU memory)
                     feature_data = {
-                        'hidden_states': fused_features_squeezed,
-                        'num_fused_layers': FUSE_LAYERS,
-                        'teacher_topk_probs': topk_probs_squeezed,    # 修复字段名：topk_probs -> teacher_topk_probs
-                        'teacher_topk_indices': topk_indices_squeezed,  # 修复字段名：topk_indices -> teacher_topk_indices
-                        'input_ids': input_ids_squeezed,
-                        'attention_mask': attention_mask_squeezed,
+                        'hidden_states': hidden_states.cpu(),
+                        'logits': logits.cpu(),
+                        'topk_probs': topk_probs.cpu(),
+                        'topk_indices': topk_indices.cpu(),
+                        'input_ids': inputs['input_ids'].cpu(),
+                        'attention_mask': inputs['attention_mask'].cpu(),
                         'prompt': text,
                         'prompt_id': prompt_id,
                         'temperature': temperature,
@@ -292,7 +264,7 @@ def progress_monitor(progress_queue, total_prompts: int, num_workers: int):
                     for gid, stats in worker_stats.items():
                         if not stats['completed'] and stats['chunk_size'] > 0:
                             progress_pct = (stats['processed'] / stats['chunk_size']) * 100
-                            # gpu_info.append(f"GPU{gid}:{progress_pct:.0f}%")
+                            gpu_info.append(f"GPU{gid}:{progress_pct:.0f}%")
                     
                     if gpu_info:
                         desc = f"Processing prompts ({', '.join(gpu_info)})"
@@ -525,9 +497,7 @@ def extract_base_features_simple(model_name: str, prompts_dir: str, output_dir: 
                     with torch.no_grad():
                         outputs = model(**inputs, output_hidden_states=True)
                         
-                        fusion_indices = get_fusion_indices(model_name, model.config.num_hidden_layers)
-                        fused_features = fuse_hidden_states(outputs.hidden_states, fusion_indices)
-                        
+                        hidden_states = outputs.hidden_states[-1]
                         logits = outputs.logits
                         
                         # Apply temperature scaling and get top-k probabilities
@@ -535,27 +505,13 @@ def extract_base_features_simple(model_name: str, prompts_dir: str, output_dir: 
                         probs = F.softmax(scaled_logits, dim=-1)
                         topk_probs, topk_indices = torch.topk(probs, k=save_topk, dim=-1)
                         
-                        # ===== 统一维度处理 =====
-                        input_ids_squeezed = inputs['input_ids'][0].cpu()
-                        attention_mask_squeezed = inputs['attention_mask'][0].cpu()
-                        fused_features_squeezed = fused_features.cpu()  # fuse_hidden_states已经去掉batch维度
-                        topk_probs_squeezed = topk_probs[0].cpu()
-                        topk_indices_squeezed = topk_indices[0].cpu()
-
-                        seq_len = input_ids_squeezed.size(0)
-                        assert attention_mask_squeezed.size(0) == seq_len
-                        assert fused_features_squeezed.size(0) == seq_len
-                        assert topk_probs_squeezed.size(0) == seq_len
-                        assert topk_indices_squeezed.size(0) == seq_len
-                        
-                        # ===== 修复字段命名 =====
                         feature_data = {
-                            'hidden_states': fused_features_squeezed,
-                            'num_fused_layers': FUSE_LAYERS,
-                            'teacher_topk_probs': topk_probs_squeezed,    # 修复字段名
-                            'teacher_topk_indices': topk_indices_squeezed,  # 修复字段名
-                            'input_ids': input_ids_squeezed,
-                            'attention_mask': attention_mask_squeezed,
+                            'hidden_states': hidden_states.cpu(),
+                            'logits': logits.cpu(),
+                            'topk_probs': topk_probs.cpu(),
+                            'topk_indices': topk_indices.cpu(),
+                            'input_ids': inputs['input_ids'].cpu(),
+                            'attention_mask': inputs['attention_mask'].cpu(),
                             'prompt': text,
                             'prompt_id': prompt_id,
                             'temperature': temperature,
@@ -678,9 +634,7 @@ def extract_base_features_threaded(model_name: str, prompts_dir: str, output_dir
             with torch.no_grad():
                 outputs = model(**inputs, output_hidden_states=True)
                 
-                fusion_indices = get_fusion_indices(model_name, model.config.num_hidden_layers)
-                fused_features = fuse_hidden_states(outputs.hidden_states, fusion_indices)
-                
+                hidden_states = outputs.hidden_states[-1]
                 logits = outputs.logits
                 
                 # Apply temperature scaling and get top-k probabilities
@@ -688,21 +642,13 @@ def extract_base_features_threaded(model_name: str, prompts_dir: str, output_dir
                 probs = F.softmax(scaled_logits, dim=-1)
                 topk_probs, topk_indices = torch.topk(probs, k=save_topk, dim=-1)
                 
-                # ===== 统一维度处理 =====
-                input_ids_squeezed = inputs['input_ids'][0].cpu()
-                attention_mask_squeezed = inputs['attention_mask'][0].cpu()
-                fused_features_squeezed = fused_features.cpu()
-                topk_probs_squeezed = topk_probs[0].cpu()
-                topk_indices_squeezed = topk_indices[0].cpu()
-                
-                # ===== 修复字段命名 =====
                 feature_data = {
-                    'hidden_states': fused_features_squeezed,
-                    'num_fused_layers': FUSE_LAYERS,
-                    'teacher_topk_probs': topk_probs_squeezed,    # 修复字段名
-                    'teacher_topk_indices': topk_indices_squeezed,  # 修复字段名
-                    'input_ids': input_ids_squeezed,
-                    'attention_mask': attention_mask_squeezed,
+                    'hidden_states': hidden_states.cpu(),
+                    'logits': logits.cpu(),
+                    'topk_probs': topk_probs.cpu(),
+                    'topk_indices': topk_indices.cpu(),
+                    'input_ids': inputs['input_ids'].cpu(),
+                    'attention_mask': inputs['attention_mask'].cpu(),
                     'prompt': text,
                     'prompt_id': prompt_id,
                     'temperature': temperature,

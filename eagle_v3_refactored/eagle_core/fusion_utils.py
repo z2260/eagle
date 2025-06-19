@@ -35,7 +35,11 @@ def get_fusion_indices(model_name: str, num_hidden_layers: int) -> List[int]:
     model_name_lower = model_name.lower()
     
     if "qwen" in model_name_lower:
+<<<<<<< HEAD
         log.info(f"Using Qwen-specific fusion strategy for {model_name}")
+=======
+        # log.info(f"Using Qwen-specific fusion strategy for {model_name}")
+>>>>>>> db3bdfab9e9ccd80be80c1a218cae4e8f83f79a4
         # Qwen模型使用特定的层选择策略
         raw = [2, num_hidden_layers // 3, 2 * num_hidden_layers // 3]
     else:
@@ -58,7 +62,11 @@ def get_fusion_indices(model_name: str, num_hidden_layers: int) -> List[int]:
             "Please check if num_hidden_layers is too small or if the index is out of bounds"
         )
     
+<<<<<<< HEAD
     log.info(f"Selected fusion layers: {indices} from {num_hidden_layers} total layers")
+=======
+    # log.info(f"Selected fusion layers: {indices} from {num_hidden_layers} total layers")
+>>>>>>> db3bdfab9e9ccd80be80c1a218cae4e8f83f79a4
     return indices
 
 

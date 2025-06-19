@@ -13,6 +13,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 import argparse
 import os
 import torch
+import torch.optim as optim
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
@@ -30,10 +31,13 @@ from accelerate.utils import set_seed
 from tqdm import tqdm
 import logging
 import numpy as np
+from datetime import datetime
+import traceback
 
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
 import json
+import math
 
 # 从统一的模块导入
 from eagle_core import FUSE_LAYERS, get_fusion_indices, fuse_hidden_states
@@ -675,10 +679,12 @@ class EagleDataset(Dataset):
     def __init__(
         self,
         data_path: str,
+        vocab_size: int,
         max_seq_len: int = 2048,
         augmentation: Optional[DataAugmentation] = None
     ):
         self.data_path = Path(data_path)
+        self.vocab_size = vocab_size
         self.max_seq_len = max_seq_len
         self.augmentation = augmentation
 
@@ -780,14 +786,11 @@ class EagleDataset(Dataset):
                 return self._get_dummy_sample()
             
             # Process the loaded sample
-            def squeeze_if_needed(t, keep_2d=True):
-                """Remove batch dimension if present."""
-                if t.dim() > 2 and t.size(0) == 1 and not keep_2d:
+            def squeeze_if_needed(t):
+                """Remove batch dimension if it exists and is 1."""
+                if t.dim() > 1 and t.size(0) == 1:
                     return t.squeeze(0)
-                elif t.dim() == 1 and keep_2d:
-                    return t.unsqueeze(0)
-                else:
-                    return t
+                return t
             
             # Extract fields
             hidden_states = data.get('hidden_states')
@@ -800,7 +803,7 @@ class EagleDataset(Dataset):
                 logger.warning(f"Fusion layers mismatch in {path}: {num_fused_layers} vs expected {FUSE_LAYERS}")
             
             # 检查并调整维度
-            hidden_states = squeeze_if_needed(hidden_states, keep_2d=False)
+            hidden_states = squeeze_if_needed(hidden_states)
             input_ids = squeeze_if_needed(input_ids)
             attention_mask = squeeze_if_needed(attention_mask)
             
@@ -835,8 +838,8 @@ class EagleDataset(Dataset):
             # Add teacher data if available
             if 'teacher_topk_probs' in data and 'teacher_topk_indices' in data:
                 # 将教师模型的topk数据添加到样本中，进行适当的维度调整
-                teacher_topk_probs = squeeze_if_needed(data['teacher_topk_probs'], keep_2d=False)
-                teacher_topk_indices = squeeze_if_needed(data['teacher_topk_indices'], keep_2d=False)
+                teacher_topk_probs = squeeze_if_needed(data['teacher_topk_probs'])
+                teacher_topk_indices = squeeze_if_needed(data['teacher_topk_indices'])
                 
                 # 检查维度
                 if teacher_topk_probs.size(0) != input_ids.size(0):
@@ -872,7 +875,7 @@ class EagleDataset(Dataset):
         except Exception as e:
             logger.error(f"Error loading sample {idx} from {self.files[idx] if idx < len(self.files) else 'unknown'}: {e}")
             return self._get_dummy_sample()
-            
+
     def _validate_processed_sample(self, sample: Dict) -> bool:
         """Validate processed sample."""
         seq_len = sample["input_ids"].size(0)
@@ -1876,6 +1879,7 @@ def main():
     try:
         train_dataset = EagleDataset(
             config.data_path,
+            config.vocab_size,
             config.max_seq_len,
             augmentation=augmentation
         )
