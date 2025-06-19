@@ -7,7 +7,7 @@ cd /root/workspace/eagle
 # Activate virtual environment
 source ./v_eagle/bin/activate
 
-cd /root/workspace/eagle/eagle/eagle_v3_refactored
+cd /root/workspace/eagle/eagle_v3_refactored
 
 # Install vLLM if needed
 pip install vllm --extra-index-url https://download.pytorch.org/whl/cu125
