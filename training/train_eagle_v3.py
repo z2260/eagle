@@ -280,6 +280,8 @@ class TrainingConfig:
     num_workers: int = 16
     wandb_project: str = "eagle-v3"
 
+    scheduler_type: str = "cosine" 
+
     # Use simple fusion as in paper
     use_simple_fusion: bool = True
 
@@ -305,6 +307,10 @@ def parse_args():
                        help='Use KL divergence loss')
     parser.add_argument('--kl_weight', type=float, default=0.7,
                        help='Weight for KL divergence loss')
+
+    parser.add_argument('--scheduler_type', type=str, default='cosine',
+                       choices=['linear', 'cosine'],
+                       help='Learning rate scheduler type (linear or cosine)')
     
     # Top-k KL arguments
     parser.add_argument('--use_topk_kl', action='store_true', default=True,
@@ -2060,7 +2066,7 @@ def main():
 
     num_training_steps = len(train_loader) * config.num_epochs // config.gradient_accumulation_steps
 
-    scheduler = get_cosine_schedule_with_warmup(
+    scheduler = get_linear_schedule_with_warmup(
         optimizer,
         num_warmup_steps=config.warmup_steps,
         num_training_steps=num_training_steps,

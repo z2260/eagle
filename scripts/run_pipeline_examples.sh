@@ -217,15 +217,15 @@ accelerate launch training/train_eagle_v3.py \
     --output_dir "./eagle_qwen_draft_v3" \
     --vocab_size 151936 \
     --hidden_size 5120 \
-    --batch_size 4 \
+    --batch_size 8 \
     --lr 5e-4 \
-    --epochs 20 \
+    --epochs 10 \
     --max_seq_len 2048 \
     --ttt_steps 3 \
     --total_steps 400000 \
-    --num_decoder_layers 4 \
+    --num_decoder_layers 2 \
     --use_kl_loss \
-    --kl_weight 0.3 \
+    --kl_weight 0.2 \
     --enable_trace \
     --gradient_accumulation_steps 4 
 
