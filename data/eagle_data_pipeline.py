@@ -117,8 +117,12 @@ def extract_base_features_worker(args_tuple):
                     logits = outputs.logits
                     
                     # Apply temperature scaling and get top-k probabilities
-                    # scaled_logits = logits / temperature
-                    scaled_logits = logits.to(torch.float32) / temperature
+                    # 安全温度缩放：如果温度接近0，不进行缩放而不是除零
+                    if temperature <= 1e-5:  # 允许0表示"不缩放"
+                        scaled_logits = logits.to(torch.float32)
+                    else:
+                        scaled_logits = logits.to(torch.float32) / temperature
+                        
                     scaled_logits = scaled_logits - scaled_logits.max(dim=-1, keepdim=True).values
                     probs = F.softmax(scaled_logits, dim=-1).to(torch.float16)
 

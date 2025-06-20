@@ -11,7 +11,7 @@ cd /root/workspace/eagle
 
 # Install vLLM if needed
 pip install vllm --extra-index-url https://download.pytorch.org/whl/cu125
-pip install scikit-learn datasets transformers accelerate tqdm wandb deepspeed
+pip install scikit-learn datasets transformers accelerate tqdm wandb deepspeed termcolor tabulate
 
 
 # Color codes for output
@@ -70,30 +70,32 @@ cleanup_port() {
     fi
 }
 
+
 # ===== CLEANUP =====
 echo -e "${YELLOW}=== Cleaning up resources ===${NC}"
 cleanup_gpu
 cleanup_port $VLLM_PORT
+cleanup_port 29500
 sleep 5
 
 # ===== STAGE 1: BUILD DATASET WITH SPLIT =====
-# echo -e "${YELLOW}=== STAGE 1: Building and splitting dataset ===${NC}"
-# python3 ./data/eagle_data_pipeline.py \
-#     --stage build \
-#     --spec "openai/gsm8k:main:20000,tatsu-lab/alpaca:20000,anthropic/hh-rlhf:40000,openai/webgpt_comparisons:20000" \
-#     --output-dir "$OUTPUT_DIR" \
-#     --eval-split-ratio $EVAL_SPLIT_RATIO \
-#     --cn-weight 0.0 \
-#     --seed 42
-
 echo -e "${YELLOW}=== STAGE 1: Building and splitting dataset ===${NC}"
 python3 ./data/eagle_data_pipeline.py \
     --stage build \
-    --spec "openai/gsm8k:main:20000,tatsu-lab/alpaca:20000" \
+    --spec "openai/gsm8k:main:20000,tatsu-lab/alpaca:20000,anthropic/hh-rlhf:40000,openai/webgpt_comparisons:20000" \
     --output-dir "$OUTPUT_DIR" \
     --eval-split-ratio $EVAL_SPLIT_RATIO \
     --cn-weight 0.0 \
     --seed 42
+
+# echo -e "${YELLOW}=== STAGE 1: Building and splitting dataset ===${NC}"
+# python3 ./data/eagle_data_pipeline.py \
+#     --stage build \
+#     --spec "openai/gsm8k:main:20000,tatsu-lab/alpaca:20000" \
+#     --output-dir "$OUTPUT_DIR" \
+#     --eval-split-ratio $EVAL_SPLIT_RATIO \
+#     --cn-weight 0.0 \
+#     --seed 42
 
 # ===== STAGE 2: EXTRACT BASE MODEL FEATURES (WITH LOGITS) =====
 echo -e "${YELLOW}=== STAGE 2: Extracting base model features and logits ===${NC}"
@@ -215,9 +217,9 @@ accelerate launch training/train_eagle_v3.py \
     --output_dir "./eagle_qwen_draft_v3" \
     --vocab_size 151936 \
     --hidden_size 5120 \
-    --batch_size 8 \
-    --lr 5e-5 \
-    --epochs 10 \
+    --batch_size 4 \
+    --lr 5e-4 \
+    --epochs 20 \
     --max_seq_len 2048 \
     --ttt_steps 3 \
     --total_steps 400000 \
@@ -231,21 +233,21 @@ accelerate launch training/train_eagle_v3.py \
 
 # ===== STAGE 6: PREPARE EVALUATION DATASETS =====
 echo -e "${YELLOW}=== STAGE 6: Preparing evaluation datasets ===${NC}"
-python3 prepare_eval_datasets.py
+python3 ./data/prepare_eval_datasets.py
 
 # ===== STAGE 7: RUN EVALUATION =====
 echo -e "${YELLOW}=== STAGE 7: Running evaluation ===${NC}"
 
 # Quick test with 2 samples
 echo "Running quick evaluation..."
-python3 eagle_v3_eval.py \
+python3 ./evaluation/eagle_v3_eval.py \
     --base_model /root/workspace/TensorRT-LLM/workspace/model/Qwen3-32B \
     --draft_ckpt "./eagle_qwen_draft_v3/final/" \
     --dataset gsm8k \
     --data_path "./eval_datasets/gsm8k_test.jsonl" \
-    --num_samples 36 \
+    --num_samples 2 \
     --max_new_tokens 1024 \
-    --temperature $TEMPERATURE \
+    --temperature 0.0 \
     --output_file results_gsm8k_greedy_quick.json
 
 echo -e "${GREEN}=== All tasks completed successfully! ===${NC}"

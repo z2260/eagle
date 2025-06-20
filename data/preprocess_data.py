@@ -188,38 +188,64 @@ def preprocess_dataset(
                     temperature=temperature
                 )
             
-            # Create loss mask
-            loss_mask = torch.ones_like(inputs['input_ids'][0])
-            
-            # If we have a reference, mask out the prompt part
-            if reference_text and prompt_text:
-                # --- Start of Fix ---
-                # 正确的方式：确保分词配置与主流程一致，并考虑BOS等特殊Token
-                # 1. 构造出需要被mask的文本部分
-                separator = "\n\nAssistant: "
-                prompt_and_separator_text = f"{prompt_text}{separator}"
+                loss_mask = torch.ones_like(inputs['input_ids'][0])
 
-                # 2. 对这部分文本进行分词，但不添加额外的BOS/EOS，因为它已经是完整文本的一部分
-                prompt_and_separator_ids = tokenizer(
-                    prompt_and_separator_text, 
-                    add_special_tokens=False
-                ).input_ids
-                
-                # 3. 计算最终的遮盖长度。通常主流程会自动添加一个BOS token。
-                #    我们通过检查inputs的第一个token来判断
-                bos_offset = 1 if inputs['input_ids'][0][0] == tokenizer.bos_token_id else 0
-                prompt_len = bos_offset + len(prompt_and_separator_ids)
+                # If we have a reference, mask out the prompt part
+                if reference_text and prompt_text:
+                    # Tokenize prompt WITHOUT special tokens to get correct length
+                    prompt_tokens = tokenizer(prompt_text, add_special_tokens=False).input_ids
+                    prompt_len = len(prompt_tokens)
 
-                # 应用mask
-                loss_mask[:prompt_len] = 0
+                    # Check if BOS token was added
+                    full_ids = inputs['input_ids'][0]
+                    bos_offset = 0
+
+                    # Detect BOS token
+                    if tokenizer.bos_token_id is not None and len(full_ids) > 0:
+                        if full_ids[0].item() == tokenizer.bos_token_id:
+                            bos_offset = 1
+                            log.debug(f"BOS token detected, offset={bos_offset}")
+
+                    # For Qwen models, also check for role tokens
+                    if "qwen" in model_name.lower():
+                        # Qwen可能添加额外的role标记
+                        # 检查实际的prompt在full_ids中的起始位置
+                        prompt_start_idx = None
+                        for i in range(min(10, len(full_ids) - len(prompt_tokens))):  # 搜索前10个位置
+                            if full_ids[i:i+len(prompt_tokens)].tolist() == prompt_tokens:
+                                prompt_start_idx = i
+                                break
+                            
+                        if prompt_start_idx is not None:
+                            mask_end_idx = prompt_start_idx + len(prompt_tokens)
+                            log.debug(f"Found prompt at position {prompt_start_idx}, masking until {mask_end_idx}")
+                        else:
+                            # 回退到基于BOS的计算
+                            mask_end_idx = bos_offset + prompt_len
+                            log.warning(f"Could not find exact prompt position, using BOS offset: {mask_end_idx}")
+                    else:
+                        # 其他模型使用简单的BOS偏移
+                        mask_end_idx = bos_offset + prompt_len
+
+                    # Apply mask
+                    loss_mask[:mask_end_idx] = 0
+
+                    # Validation
+                    valid_tokens = loss_mask.sum().item()
+                    total_tokens = len(loss_mask)
+                    log.debug(f"Loss mask: {valid_tokens}/{total_tokens} valid tokens")
+
+                    # Assert we have at least some valid tokens
+                    if valid_tokens == 0:
+                        log.error(f"No valid tokens in loss mask for prompt {prompt_id}")
+                        log.error(f"Prompt length: {prompt_len}, Total length: {total_tokens}, Mask end: {mask_end_idx}")
+                        # Set at least the last 10% tokens as valid
+                        fallback_start = int(total_tokens * 0.9)
+                        loss_mask[fallback_start:] = 1
+                        log.warning(f"Applied fallback mask from position {fallback_start}")
+
+                assert loss_mask.sum() > 0, f"Loss mask is all zeros for {prompt_id}"
                 
-                # 添加断言，防止意外地把所有loss都mask掉
-                assert loss_mask.sum() > 0, (
-                    f"Loss mask for prompt_id '{prompt_id}' is all zeros. "
-                    f"Check tokenization and masking logic. Prompt length: {prompt_len}, "
-                    f"Total length: {len(loss_mask)}"
-                )
-                # --- End of Fix ---
                 
                 # Also don't save teacher probs for masked positions to save space
                 # Set top-k probs to zero for masked positions

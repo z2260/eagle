@@ -1,0 +1,123 @@
+_wandb:
+    value:
+        cli_version: 0.20.1
+        m: []
+        python_version: 3.10.12
+        t:
+            "1":
+                - 1
+                - 5
+                - 11
+                - 41
+                - 49
+                - 53
+                - 71
+                - 105
+            "2":
+                - 1
+                - 5
+                - 11
+                - 41
+                - 49
+                - 53
+                - 71
+                - 105
+            "3":
+                - 16
+                - 55
+            "4": 3.10.12
+            "5": 0.20.1
+            "6": 4.52.3
+            "12": 0.20.1
+            "13": linux-x86_64
+auto_detect_hidden_size:
+    value: true
+batch_size:
+    value: 4
+checkpoint_on_nan:
+    value: true
+data_path:
+    value: ./eagle_qwen_data_v3/base_features/train
+draft_checkpoint:
+    value: null
+enable_trace:
+    value: true
+eps:
+    value: 1e-08
+eval_steps:
+    value: 500
+feature_loss_weight:
+    value: 0
+gradient_accumulation_steps:
+    value: 4
+gradient_clip_val:
+    value: 1
+hidden_size:
+    value: 5120
+kl_temperature:
+    value: 2
+kl_weight:
+    value: 0.3
+learning_rate:
+    value: 0.0005
+logging_steps:
+    value: 100
+max_grad_norm:
+    value: 1
+max_logit_value:
+    value: 30
+max_seq_len:
+    value: 2048
+mixed_precision:
+    value: bf16
+nan_debug_mode:
+    value: false
+noise_std:
+    value: 0.2
+noise_type:
+    value: uniform
+num_decoder_layers:
+    value: 4
+num_epochs:
+    value: 20
+num_workers:
+    value: 16
+output_dir:
+    value: ./eagle_qwen_draft_v3
+save_steps:
+    value: 1000
+seed:
+    value: 42
+skip_nan_batches:
+    value: true
+token_loss_weight:
+    value: 1
+topk_size:
+    value: 50
+total_steps:
+    value: 400000
+trace_output_dir:
+    value: ./traces
+ttt_step_weights:
+    value:
+        - 1
+        - 0.5
+        - 0.3333333333333333
+ttt_steps:
+    value: 3
+use_kl_loss:
+    value: true
+use_noise:
+    value: true
+use_simple_fusion:
+    value: true
+use_topk_kl:
+    value: true
+vocab_size:
+    value: 151936
+wandb_project:
+    value: eagle-v3
+warmup_steps:
+    value: 2000
+weight_decay:
+    value: 0.01

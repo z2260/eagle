@@ -1,0 +1,14 @@
+[
+  {
+    "turns": [
+      "Explain the concept of quantum entanglement to a 10-year-old.",
+      "Now explain it to a physics undergraduate student."
+    ]
+  },
+  {
+    "turns": [
+      "Write a Python function to find the longest palindrome in a string.",
+      "Now optimize it for better time complexity."
+    ]
+  }
+]

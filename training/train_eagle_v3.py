@@ -40,7 +40,7 @@ import json
 import math
 
 # 从统一的模块导入
-from eagle_core import FUSE_LAYERS, get_fusion_indices, fuse_hidden_states
+from eagle_core.fusion_utils import FUSE_LAYERS, get_fusion_indices, fuse_hidden_states
 
 try:
     import wandb
@@ -392,24 +392,28 @@ def parse_args():
 #------------------------------------------------------------------
 
 class SimpleFusion(nn.Module):
-    """Simple linear fusion as described in the paper."""
+    """Simple fusion module that just does a linear projection to reduce dimensionality."""
 
     def __init__(self, base_hidden_size: int, n_layers: int = 3):
         super().__init__()
-        self.base_hidden_size = base_hidden_size
-        self.n_layers = n_layers
-        self.proj = nn.Linear(n_layers * base_hidden_size, base_hidden_size, bias=False)
-        
+        self.linear = nn.Linear(base_hidden_size * n_layers, base_hidden_size, bias=True)
+    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: [batch, seq_len, n_layers * base_hidden_size]"""
-        out = self.proj(x)
-        # Check for NaN
-        if check_tensor_health(out, "SimpleFusion output"):
-            return out
-        else:
-            # Return input's mean as fallback
-            logger.warning("SimpleFusion produced NaN, returning averaged input")
-            return x.view(*x.shape[:-1], self.n_layers, self.base_hidden_size).mean(dim=-2)
+        """Forward pass with added NaN detection and recovery."""
+        # 检测输入是否包含NaN
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            nan_logger.warning("NaN/Inf detected in SimpleFusion input, applying recovery")
+            x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+            
+        # 正常的前向计算
+        fusion_output = self.linear(x)
+        
+        # 检测输出是否包含NaN
+        if torch.isnan(fusion_output).any() or torch.isinf(fusion_output).any():
+            nan_logger.error("Unhealthy tensor detected: SimpleFusion output")
+            fusion_output = torch.nan_to_num(fusion_output, nan=0.0, posinf=0.0, neginf=0.0)
+            
+        return fusion_output
 
 
 class MultiLayerFeatureFusion(nn.Module):
@@ -748,6 +752,13 @@ class EagleDataset(Dataset):
             logger.warning("NaN or Inf values found in hidden_states")
             return False
             
+        # 检查teacher_topk_probs中的NaN/Inf值
+        if 'teacher_topk_probs' in data:
+            teacher_probs = data['teacher_topk_probs']
+            if torch.isnan(teacher_probs).any() or torch.isinf(teacher_probs).any():
+                logger.warning("NaN or Inf values found in teacher_topk_probs")
+                return False
+            
         # Check hidden_states dimensions - expect last dim to be multiple of FUSE_LAYERS
         if hidden_states.size(-1) % FUSE_LAYERS != 0:
             logger.warning(f"Hidden states dim {hidden_states.size(-1)} is not divisible by FUSE_LAYERS={FUSE_LAYERS}")
@@ -903,27 +914,29 @@ class EagleDataset(Dataset):
         return self.base_hidden
 
 
+# training/train_eagle_v3.py
+
 def collate_fn(samples: List[Dict]) -> Dict[str, torch.Tensor]:
-    """Robust collate function."""
+    """Robust collate function with added diagnostics."""
     
-    # Filter valid samples
+    # 过滤无效样本 (您的代码中已有，保持不变)
     valid_samples = []
     for i, sample in enumerate(samples):
         try:
-            if all(sample[key].size(0) == sample['input_ids'].size(0) 
-                   for key in ['hidden_states', 'attention_mask', 'loss_mask']):
-                valid_samples.append(sample)
+            # 增加一个检查，确保 'hidden_states' 存在且为2D张量
+            if 'hidden_states' in sample and isinstance(sample['hidden_states'], torch.Tensor) and sample['hidden_states'].dim() == 2:
+                 valid_samples.append(sample)
             else:
-                error_logger.warning(f"Skipping sample {i} due to dimension mismatch")
+                error_logger.warning(f"Skipping sample {i} due to missing, invalid, or non-2D 'hidden_states'.")
         except Exception as e:
-            error_logger.warning(f"Skipping sample {i} due to error: {e}")
+            error_logger.warning(f"Skipping sample {i} due to error during validation: {e}")
     
     if not valid_samples:
-        error_logger.error("No valid samples in batch!")
-        # Return a dummy batch
+        error_logger.error("No valid samples in batch! Returning a dummy batch.")
+        # 返回一个明确知道形状的虚拟批次
         return {
             'input_ids': torch.zeros(1, 10, dtype=torch.long),
-            'hidden_states': torch.randn(1, 10, 5120*3) * 0.02,
+            'hidden_states': torch.randn(1, 10, 15360), # 使用您期望的维度
             'attention_mask': torch.ones(1, 10),
             'loss_mask': torch.ones(1, 10),
             'teacher_topk_indices': torch.zeros(1, 10, 50, dtype=torch.long),
@@ -935,28 +948,69 @@ def collate_fn(samples: List[Dict]) -> Dict[str, torch.Tensor]:
     max_len = max(s['input_ids'].size(0) for s in samples)
     batch_size = len(samples)
 
-    # Get dimensions
-    hidden_dim = samples[0]['hidden_states'].size(-1)
-    topk_size = samples[0]['teacher_topk_indices'].size(-1)
-    
-    # Initialize tensors
+    # --- 诊断点 1: 检查第一个样本并建立基准维度 ---
+    try:
+        first_sample_hs = samples[0]['hidden_states']
+        hidden_dim = first_sample_hs.size(-1)
+        print(f"[DEBUG] collate_fn: Baseline hidden_dim={hidden_dim} from first sample shape {first_sample_hs.shape}")
+    except (KeyError, IndexError) as e:
+        print(f"[ERROR] collate_fn: Failed to get hidden_dim from the first sample. Error: {e}")
+        raise
+
+    # 初始化批次张量
     input_ids = torch.zeros(batch_size, max_len, dtype=torch.long)
     hidden_states = torch.zeros(batch_size, max_len, hidden_dim)
     attention_mask = torch.zeros(batch_size, max_len)
     loss_mask = torch.zeros(batch_size, max_len)
+    # 假设topk_size已知或从第一个样本获取
+    topk_size = samples[0].get('teacher_topk_indices', torch.zeros(1,1,50)).shape[-1]
     teacher_topk_indices = torch.zeros(batch_size, max_len, topk_size, dtype=torch.long)
     teacher_topk_probs = torch.zeros(batch_size, max_len, topk_size)
 
-    # Fill tensors
+    # --- 诊断点 2: 在循环中检查每个样本 ---
     for i, sample in enumerate(samples):
-        seq_len = sample['input_ids'].size(0)
-        input_ids[i, :seq_len] = sample['input_ids']
-        hidden_states[i, :seq_len] = sample['hidden_states']
-        attention_mask[i, :seq_len] = sample['attention_mask']
-        loss_mask[i, :seq_len] = sample['loss_mask']
-        teacher_topk_indices[i, :seq_len] = sample['teacher_topk_indices']
-        teacher_topk_probs[i, :seq_len] = sample['teacher_topk_probs']
+        try:
+            seq_len = sample['input_ids'].size(0)
+            
+            # 获取源张量和目标切片
+            source_tensor = sample['hidden_states']
+            target_slice = hidden_states[i, :seq_len]
+            
+            # 在赋值前进行形状比较
+            if source_tensor.shape != target_slice.shape:
+                print(f"\n\n\n!!!!! SHAPE MISMATCH DETECTED in collate_fn !!!!!")
+                print(f"  - Batch item index: {i}")
+                print(f"  - Target slice shape for assignment: {target_slice.shape}")
+                print(f"  - Source tensor 'hidden_states' shape: {source_tensor.shape}")
+                print(f"  - This means the hidden_dim of this sample ({source_tensor.shape[-1]}) does not match the batch's hidden_dim ({hidden_dim}).")
+                # 为了防止程序崩溃，我们可以跳过这个坏样本，而不是让它崩溃
+                print(f"  - SKIPPING this corrupted sample to continue training.")
+                continue # 跳过这个样本
 
+            # 如果形状匹配，则正常赋值
+            hidden_states[i, :seq_len] = source_tensor
+            
+            # 处理其他张量
+            input_ids[i, :seq_len] = sample['input_ids']
+            attention_mask[i, :seq_len] = sample['attention_mask']
+            loss_mask[i, :seq_len] = sample['loss_mask']
+            if 'teacher_topk_indices' in sample:
+                teacher_topk_indices[i, :seq_len] = sample['teacher_topk_indices']
+                teacher_topk_probs[i, :seq_len] = sample['teacher_topk_probs']
+
+        except Exception as e:
+            print(f"\n\n\n!!!!! EXCEPTION in collate_fn loop !!!!!")
+            print(f"  - Batch item index: {i}")
+            print(f"  - Error: {e}")
+            # 打印出这个出问题的样本的所有信息
+            for key, value in sample.items():
+                if isinstance(value, torch.Tensor):
+                    print(f"    - sample['{key}'].shape = {value.shape}")
+                else:
+                    print(f"    - sample['{key}'] = {value}")
+            continue
+
+    # 准备最终返回的批次
     return {
         'input_ids': input_ids,
         'hidden_states': hidden_states,
@@ -1057,6 +1111,9 @@ def compute_topk_kl_loss_robust(
     If temperature is near zero, it switches to cross-entropy loss against the argmax target.
     Handles the 0 * log(0) = NaN issue using torch.nan_to_num for guaranteed stability.
     """
+    # 输入净化：首先确保teacher_topk_probs不含NaN或Inf
+    teacher_topk_probs = torch.nan_to_num(teacher_topk_probs, nan=0.0, posinf=0.0, neginf=0.0)
+    
     # --- 开始修改 ---
     if temperature < 1e-4:
         # 温度为0或接近0，切换到交叉熵损失，这是最稳健的做法
@@ -1092,11 +1149,8 @@ def compute_topk_kl_loss_robust(
         # 对教师概率进行归一化，确保它们在k维上和为1
         teacher_topk_probs = F.normalize(teacher_topk_probs, p=1, dim=-1)
 
-        # --- 核心修复：使用 torch.nan_to_num 来保证数值稳定 ---
-        # KL散度公式 P * (log(P) - log(Q)) 在 P=0 时会导致 0 * -inf = NaN
-        
-        # 安全地计算 log(P)，在log内部加eps防止log(0)
-        teacher_log_probs = torch.log(teacher_topk_probs + eps)
+        # 安全地计算log(P)，先确保所有概率值都是正数
+        teacher_log_probs = torch.log(teacher_topk_probs.clamp_min(eps))
 
         # 计算KL散度的每个分项
         kl_term = teacher_topk_probs * (teacher_log_probs - student_topk_log_probs)

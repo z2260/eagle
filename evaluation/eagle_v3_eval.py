@@ -13,6 +13,11 @@ import numpy as np
 import logging
 from collections import defaultdict
 
+import sys
+from pathlib import Path
+# 添加eagle_v3_refactored到Python路径
+sys.path.append(str(Path(__file__).parent.parent))
+
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -24,7 +29,7 @@ from tabulate import tabulate  # For nice tables
 from transformers.cache_utils import DynamicCache, Cache
 
 # Import from training script
-from train_eagle_v3 import (
+from training.train_eagle_v3 import (
     DraftModelV3,
     build_tree_buffers,
     make_causal_mask,
@@ -33,7 +38,7 @@ from train_eagle_v3 import (
 )
 
 # Import from eagle_core
-from eagle_core import get_fusion_indices
+from eagle_core.fusion_utils import get_fusion_indices
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -558,48 +563,37 @@ class EAGLE3InferenceUpdated:
         return output_text, acceptance_records, draft_cycles
     
     def _fuse_features_from_buffer(self, all_hidden_states: List[torch.Tensor], position: int) -> torch.Tensor:
-        """Fuse features from multiple layers at a specific position."""
+        """Fuse features from multiple layers at a specific position using unified strategy."""
         n_layers = len(all_hidden_states) - 1  # Exclude embedding layer
-        
-        # --- 关键修复：确保与训练阶段使用相同的特征融合方式 ---
-        # 1. 统一使用get_fusion_indices函数，它在数据处理和训练中都被使用
-        # 2. 合理获取模型名称，以触发正确的分支逻辑（qwen或其他）
-        try:
-            # 首先尝试从config._name_or_path获取模型名称
-            model_name_for_fusion = self.base_model.config._name_or_path
-            # 对于某些加载方式，名称可能在其他属性中
-            if not model_name_for_fusion:
-                if hasattr(self.base_model.config, 'name_or_path'):
-                    model_name_for_fusion = self.base_model.config.name_or_path
-                elif hasattr(self.base_model.config, 'model_type'):
-                    model_name_for_fusion = self.base_model.config.model_type
-        except AttributeError:
-            # 回退方案，根据模型结构推测模型类型
-            if hasattr(self.base_model, 'model_type'):
-                model_name_for_fusion = self.base_model.model_type
-            else:
-                # 默认假设为qwen，这是可能的最常见情况
-                model_name_for_fusion = "qwen"
-            logger.warning(f"Couldn't detect model name, using {model_name_for_fusion} as fallback")
-            
-        logger.info(f"Using model name '{model_name_for_fusion}' to determine fusion indices")
-        indices = get_fusion_indices(model_name_for_fusion, n_layers)
-        logger.info(f"Selected fusion layers: {indices} from {n_layers} total layers")
-        # --- 修复结束 ---
-        
+
+        # 使用统一的融合索引策略
+        from eagle_core.fusion_utils import get_fusion_indices
+
+        # 获取模型名称
+        model_name = getattr(self.base_model.config, '_name_or_path', 'unknown')
+
+        # 获取正确的融合索引
+        indices = get_fusion_indices(model_name, n_layers)
+
         # Check bounds
         max_pos = min(hs.shape[1] for hs in all_hidden_states)
         if position >= max_pos:
             position = max_pos - 1
-        
+
         # Extract and concatenate features
         features = []
         for idx in indices:
-            # +1 是因为 all_hidden_states[0] 是 embedding 层
-            features.append(all_hidden_states[idx + 1][:, position:position+1, :])
-        
+            features.append(all_hidden_states[idx][:, position:position+1, :])
+
         fused = torch.cat(features, dim=-1)
-        
+
+        # 验证维度一致性
+        from eagle_core.fusion_utils import validate_fusion_consistency
+        base_hidden_size = all_hidden_states[1].size(-1)  # 从第一个隐藏层获取
+
+        if not validate_fusion_consistency(fused, base_hidden_size, model_name):
+            logger.error(f"Fusion dimension mismatch at position {position}")
+
         return fused
     
     def _draft_tokens_chain_visual(
